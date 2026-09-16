@@ -553,7 +553,7 @@ function App() {
               <div className="asset-grid">
                 {media.length === 0 && <div className="empty-assets">Your imported media will appear here.</div>}
                 {media.map(asset => (
-                  <button key={asset.id} className="asset-card" onDoubleClick={() => addAsset(asset)} onClick={() => addAsset(asset)} title="Click to add at playhead">
+                  <button key={asset.id} className="asset-card" onClick={() => addAsset(asset)} title="Click to add at playhead">
                     <div className="asset-thumb">
                       {asset.kind === 'image' ? <img src={asset.url}/> :
                        asset.kind === 'video' ? <video src={asset.url}/> : <Music2 size={28}/>}
@@ -585,7 +585,7 @@ function App() {
               )}
               {visibleClips
                 .filter(({ clip }) => clip.type !== 'audio')
-                .sort((a,b) => a.trackIndex - b.trackIndex)
+                .sort((a,b) => b.trackIndex - a.trackIndex)
                 .map(({ clip }) => (
                   <div key={clip.id} className={`preview-layer ${selectedClipId === clip.id ? 'selected' : ''}`}
                     style={{ left: clip.x + '%', top: clip.y + '%', opacity: clip.opacity, transform: `translate(-50%,-50%) scale(${clip.scale}) rotate(${clip.rotation}deg)` }}
