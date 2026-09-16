@@ -139,6 +139,7 @@ function App() {
   const [clipboard, setClipboard] = useState<Clip | null>(null)
   const [showExport, setShowExport] = useState(false)
   const dragRef = useRef<DragState | null>(null)
+  const scrubbingRef = useRef(false)
   const rafRef = useRef<number | null>(null)
   const lastFrameRef = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -216,13 +217,24 @@ function App() {
   }
 
   const deleteSelected = () => {
-    if (!selectedClipId) return
+    if (!selectedClipId || !selected) return
     commit(p => {
-      p.tracks.forEach(track => {
-        track.clips = track.clips.filter(c => c.id !== selectedClipId)
-      })
+      const track = p.tracks.find(t => t.id === selected.trackId)
+      if (!track || track.locked) return p
+
+      const deleted = track.clips.find(c => c.id === selectedClipId)
+      if (!deleted) return p
+
+      const deletedEnd = deleted.start + deleted.duration
+      track.clips = track.clips
+        .filter(c => c.id !== selectedClipId)
+        .map(c => c.start >= deletedEnd - 0.0001
+          ? { ...c, start: Math.max(deleted.start, c.start - deleted.duration) }
+          : c)
+
       return p
     })
+    setPlayhead(selected.start)
     setSelectedClipId(null)
   }
 
@@ -342,12 +354,34 @@ function App() {
     dragRef.current = null
   }
 
-  const seekFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    const scrollLeft = timelineRef.current?.scrollLeft ?? 0
+  const setPlayheadFromClientX = (clientX: number) => {
+    const timeline = timelineRef.current
+    if (!timeline) return
+    const rect = timeline.getBoundingClientRect()
     const laneLabelWidth = 190
-    const x = event.clientX - rect.left + scrollLeft - laneLabelWidth
-    if (x >= 0) setPlayhead(Math.max(0, Math.min(project.duration, x / pxPerSecond)))
+    const x = clientX - rect.left + timeline.scrollLeft - laneLabelWidth
+    setPlayhead(Math.max(0, Math.min(project.duration, x / pxPerSecond)))
+  }
+
+  const beginTimelineScrub = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    setPlaying(false)
+    scrubbingRef.current = true
+    ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+    setPlayheadFromClientX(event.clientX)
+  }
+
+  const moveTimelineScrub = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!scrubbingRef.current) return
+    setPlayheadFromClientX(event.clientX)
+  }
+
+  const endTimelineScrub = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!scrubbingRef.current) return
+    setPlayheadFromClientX(event.clientX)
+    scrubbingRef.current = false
+    const target = event.currentTarget as HTMLElement
+    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId)
   }
 
   useEffect(() => {
@@ -711,7 +745,11 @@ function App() {
           </div>
           <div className="timeline-scroll" ref={timelineRef}>
             <div className="timeline-inner" style={{ width: 190 + project.duration * pxPerSecond + 120 }}>
-              <div className="ruler-row" onPointerDown={seekFromPointer}>
+              <div className="ruler-row timeline-scrub-zone"
+                onPointerDown={beginTimelineScrub}
+                onPointerMove={moveTimelineScrub}
+                onPointerUp={endTimelineScrub}
+                onPointerCancel={endTimelineScrub}>
                 <div className="ruler-spacer"/>
                 <div className="ruler" style={{ width: project.duration * pxPerSecond }}>
                   {ticks.map(t => <div className="tick" key={t} style={{ left: t * pxPerSecond }}><span>{formatTime(t).slice(0,5)}</span></div>)}
@@ -727,7 +765,12 @@ function App() {
                       <button onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button>
                     </div>
                   </div>
-                  <div className="track-lane" style={{ width: project.duration * pxPerSecond }} onPointerDown={seekFromPointer}>
+                  <div className="track-lane timeline-scrub-zone"
+                    style={{ width: project.duration * pxPerSecond }}
+                    onPointerDown={beginTimelineScrub}
+                    onPointerMove={moveTimelineScrub}
+                    onPointerUp={endTimelineScrub}
+                    onPointerCancel={endTimelineScrub}>
                     {track.clips.map(clip => (
                       <div key={clip.id}
                         className={`timeline-clip ${TRACK_COLORS[clip.type]} ${selectedClipId===clip.id?'selected':''} ${track.locked?'locked':''}`}
