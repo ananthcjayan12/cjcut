@@ -15,6 +15,8 @@ type MediaAsset = {
   kind: MediaKind
   url: string
   duration: number
+  width?: number
+  height?: number
 }
 
 type Clip = {
@@ -159,6 +161,14 @@ function App() {
       .flatMap((t, trackIndex) => t.clips.map(c => ({ clip: c, trackIndex })))
       .filter(({ clip }) => playhead >= clip.start && playhead < clip.start + clip.duration),
   [project, playhead])
+
+  const activeMediaKey = useMemo(() =>
+    visibleClips
+      .filter(({ clip }) => clip.url && (clip.type === 'video' || clip.type === 'audio'))
+      .map(({ clip }) => clip.id)
+      .sort()
+      .join('|'),
+  [visibleClips])
 
   const pushSnapshot = (snapshot: Project) => {
     setPast(p => [...p.slice(-49), clone(snapshot)])
@@ -366,21 +376,50 @@ function App() {
     }
   }, [playing, project.duration])
 
+  // Keep media playback continuous. Re-seeking a <video>/<audio> element on every
+  // animation frame forces the browser decoder to flush repeatedly and causes
+  // visible frame stalls and distorted/choppy audio.
   useEffect(() => {
+    if (!playing) return
+
+    const activeIds = new Set(activeMediaKey ? activeMediaKey.split('|') : [])
+    Object.entries(previewRefs.current).forEach(([id, element]) => {
+      if (element && !activeIds.has(id)) element.pause()
+    })
+
+    visibleClips.forEach(({ clip }) => {
+      if (!clip.url || (clip.type !== 'video' && clip.type !== 'audio')) return
+      const el = previewRefs.current[clip.id]
+      if (!el) return
+
+      const target = clip.sourceStart + (playhead - clip.start) * clip.speed
+      try { el.currentTime = Math.max(0, target) } catch { /* metadata may still be loading */ }
+      el.volume = Math.max(0, Math.min(1, clip.volume))
+      el.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
+      el.play().catch(() => undefined)
+    })
+    // Sync once when playback starts or the active clip set changes. From there,
+    // the browser media clock is allowed to run without repeated seeks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing, activeMediaKey])
+
+  // While paused/scrubbing we do want frame-accurate seeking so the preview
+  // follows the playhead immediately.
+  useEffect(() => {
+    if (playing) return
     visibleClips.forEach(({ clip }) => {
       if (!clip.url || (clip.type !== 'video' && clip.type !== 'audio')) return
       const el = previewRefs.current[clip.id]
       if (!el) return
       const target = clip.sourceStart + (playhead - clip.start) * clip.speed
-      if (Math.abs(el.currentTime - target) > 0.12) {
-        try { el.currentTime = Math.max(0, target) } catch { /* metadata not ready */ }
+      if (Math.abs(el.currentTime - target) > 0.015) {
+        try { el.currentTime = Math.max(0, target) } catch { /* metadata may still be loading */ }
       }
       el.volume = Math.max(0, Math.min(1, clip.volume))
       el.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
-      if (playing) el.play().catch(() => undefined)
-      else el.pause()
+      el.pause()
     })
-  }, [playhead, playing, visibleClips])
+  }, [playhead, playing, activeMediaKey, visibleClips])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -405,14 +444,30 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   })
 
-  const readMediaDuration = (file: File, url: string, kind: MediaKind) => new Promise<number>(resolve => {
-    if (kind === 'image') return resolve(5)
-    const el = document.createElement(kind === 'audio' ? 'audio' : 'video')
-    el.preload = 'metadata'
-    el.onloadedmetadata = () => resolve(Number.isFinite(el.duration) ? el.duration : 5)
-    el.onerror = () => resolve(5)
-    el.src = url
-  })
+  const readMediaMetadata = (url: string, kind: MediaKind) =>
+    new Promise<{duration: number; width?: number; height?: number}>(resolve => {
+      if (kind === 'image') {
+        const image = new window.Image()
+        image.onload = () => resolve({
+          duration: 5,
+          width: image.naturalWidth || undefined,
+          height: image.naturalHeight || undefined,
+        })
+        image.onerror = () => resolve({ duration: 5 })
+        image.src = url
+        return
+      }
+
+      const el = document.createElement(kind === 'audio' ? 'audio' : 'video')
+      el.preload = 'metadata'
+      el.onloadedmetadata = () => resolve({
+        duration: Number.isFinite(el.duration) ? el.duration : 5,
+        width: kind === 'video' && el instanceof HTMLVideoElement ? el.videoWidth || undefined : undefined,
+        height: kind === 'video' && el instanceof HTMLVideoElement ? el.videoHeight || undefined : undefined,
+      })
+      el.onerror = () => resolve({ duration: 5 })
+      el.src = url
+    })
 
   const importMedia = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = [...(event.target.files ?? [])]
@@ -423,8 +478,8 @@ function App() {
         : file.type.startsWith('image/') ? 'image' : null
       if (!kind) continue
       const url = URL.createObjectURL(file)
-      const duration = await readMediaDuration(file, url, kind)
-      assets.push({ id: uid(), name: file.name, kind, url, duration })
+      const metadata = await readMediaMetadata(url, kind)
+      assets.push({ id: uid(), name: file.name, kind, url, ...metadata })
     }
     setMedia(current => [...current, ...assets])
     event.target.value = ''
@@ -432,6 +487,12 @@ function App() {
 
   const addAsset = (asset: MediaAsset) => {
     commit(p => {
+      const hasPrimaryVideo = p.tracks.some(t => t.type === 'video' && t.clips.length > 0)
+      if (asset.kind === 'video' && !hasPrimaryVideo && asset.width && asset.height) {
+        p.width = asset.width
+        p.height = asset.height
+      }
+
       let track = p.tracks.find(t => t.type === asset.kind && !t.locked)
       if (!track && asset.kind === 'image') track = p.tracks.find(t => t.id === 'overlay')
       if (!track) {
@@ -528,7 +589,7 @@ function App() {
         <div className="top-actions">
           <button className="icon-btn" onClick={undo} disabled={!past.length} title="Undo (Ctrl/Cmd+Z)"><Undo2 size={18}/></button>
           <button className="icon-btn" onClick={redo} disabled={!future.length} title="Redo (Ctrl/Cmd+Shift+Z)"><Redo2 size={18}/></button>
-          <button className="ratio-btn"><Maximize2 size={15}/> 16:9</button>
+          <button className="ratio-btn" title="Project resolution detected from the primary video"><Maximize2 size={15}/> {project.width}×{project.height}</button>
           <button className="export-btn" onClick={() => setShowExport(true)}><Download size={17}/> Export</button>
           <button className="icon-btn"><Settings2 size={18}/></button>
         </div>
@@ -587,7 +648,7 @@ function App() {
                 .filter(({ clip }) => clip.type !== 'audio')
                 .sort((a,b) => b.trackIndex - a.trackIndex)
                 .map(({ clip }) => (
-                  <div key={clip.id} className={`preview-layer ${selectedClipId === clip.id ? 'selected' : ''}`}
+                  <div key={clip.id} className={`preview-layer ${clip.type === 'video' || clip.type === 'image' ? 'media-layer' : ''} ${selectedClipId === clip.id ? 'selected' : ''}`}
                     style={{ left: clip.x + '%', top: clip.y + '%', opacity: clip.opacity, transform: `translate(-50%,-50%) scale(${clip.scale}) rotate(${clip.rotation}deg)` }}
                     onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id) }}>
                     {clip.type === 'video' && clip.url && <video ref={el => { previewRefs.current[clip.id] = el }} src={clip.url} muted={clip.volume === 0} playsInline />}
