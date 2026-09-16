@@ -122,6 +122,7 @@ kbd { font-size:9px; color:#68727f; font-family:inherit; }
 .track-actions button { width:22px; height:24px; display:grid; place-items:center; color:#68727f; padding:0; }
 .track-actions svg { width:13px; }
 .track-lane { position:relative; min-height:52px; background-image:linear-gradient(to right,#171b20 1px,transparent 1px); background-size:44px 100%; }
+.timeline-scrub-zone { cursor: ew-resize; touch-action: none; }
 .timeline-clip { position:absolute; top:5px; height:42px; border-radius:5px; border:1px solid transparent; overflow:hidden; user-select:none; cursor:grab; }
 .timeline-clip.selected { outline:2px solid #fff; outline-offset:-2px; }
 .timeline-clip.locked { opacity:.55; cursor:not-allowed; }
