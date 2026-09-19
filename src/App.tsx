@@ -5,6 +5,7 @@ import {
   Unlock, Upload, Volume2, ZoomIn, ZoomOut
 } from 'lucide-react'
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { splitTimelineClip } from './timeline-operations'
 
 export type TrackType = 'video' | 'image' | 'audio' | 'text'
 export type MediaKind = Exclude<TrackType, 'text'>
@@ -152,7 +153,8 @@ export function CJCutEditor({
   const [project, setProject] = useState<Project>(() => clone(initialProject ?? START_PROJECT))
   const [media, setMedia] = useState<MediaAsset[]>([])
   const [selectedClipId, setSelectedClipId] = useState<string | null>(initialProject ? null : 'welcome-title')
-  const [playhead, setPlayhead] = useState(2.2)
+  const [playhead, setPlayhead] = useState(initialProject ? 0 : 2.2)
+  const [editNotice, setEditNotice] = useState('')
   const [playing, setPlaying] = useState(false)
   const [zoom, setZoom] = useState(1)
   const [snap, setSnap] = useState(true)
@@ -181,6 +183,7 @@ export function CJCutEditor({
     setProject(clone(initialProject))
     setSelectedClipId(null)
     setPlayhead(0)
+    setEditNotice('')
     setPlaying(false)
     setPast([])
     setFuture([])
@@ -282,28 +285,27 @@ export function CJCutEditor({
   }
 
   const splitSelected = () => {
-    if (!selected) return
-    if (playhead <= selected.start + 0.05 || playhead >= selected.start + selected.duration - 0.05) return
-    commit(p => {
-      const track = p.tracks.find(t => t.id === selected.trackId)
-      if (!track || track.locked) return p
-      const original = track.clips.find(c => c.id === selected.id)
-      if (!original) return p
-      const leftDuration = playhead - original.start
-      const rightDuration = original.duration - leftDuration
-      const right: Clip = {
-        ...clone(original),
-        id: uid(),
-        name: original.name + ' cut',
-        start: playhead,
-        duration: rightDuration,
-        sourceStart: original.sourceStart + leftDuration * original.speed,
-      }
-      original.duration = leftDuration
-      track.clips.push(right)
-      setSelectedClipId(right.id)
-      return p
-    })
+    // A scrub can move the playhead away from a previously selected clip. In
+    // that case cut the topmost unlocked clip under the playhead instead.
+    const containsPlayhead = (clip: Clip) =>
+      playhead > clip.start + 0.05 && playhead < clip.start + clip.duration - 0.05
+    const selectedTrack = project.tracks.find(track => track.id === selected?.trackId)
+    const target = selected && selectedTrack?.visible && !selectedTrack.locked && containsPlayhead(selected)
+      ? selected
+      : project.tracks
+        .filter(track => track.visible && !track.locked)
+        .flatMap(track => track.clips)
+        .find(containsPlayhead) ?? selected
+    const result = splitTimelineClip(project, target?.id ?? null, playhead, uid())
+    if (!result.ok) {
+      setEditNotice(result.reason)
+      return
+    }
+    setPlaying(false)
+    pushSnapshot(project)
+    setProject(result.project)
+    setSelectedClipId(result.rightId)
+    setEditNotice('Clip split at playhead. You can move or trim either half independently.')
   }
 
   const duplicateSelected = () => {
@@ -390,10 +392,19 @@ export function CJCutEditor({
     })
   }
 
-  const endClipDrag = () => {
+  const endClipDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
     if (!drag) return
-    pushSnapshot(drag.snapshot)
+    if (drag.mode === 'move' && Math.abs(event.clientX - drag.startX) <= 3) {
+      // A click selects the clip AND seeks within it, as in a normal NLE.
+      // Previously it only selected; Split then silently did nothing because
+      // the playhead was somewhere else.
+      setPlaying(false)
+      setPlayheadFromClientX(event.clientX)
+      setEditNotice('')
+    } else {
+      pushSnapshot(drag.snapshot)
+    }
     dragRef.current = null
   }
 
@@ -789,7 +800,7 @@ export function CJCutEditor({
               <button onClick={undo} title="Undo"><Undo2 size={17}/></button>
               <button onClick={redo} title="Redo"><Redo2 size={17}/></button>
               <span className="divider"/>
-              <button className="tool-with-label" onClick={splitSelected}><Scissors size={17}/> Split <kbd>Ctrl+B</kbd></button>
+              <button className="tool-with-label" onClick={splitSelected} title="Select a clip, position the playhead inside it, then split. Shortcut: Ctrl/Cmd+B"><Scissors size={17}/> Split <kbd>Ctrl+B</kbd></button>
               <button className="tool-with-label" onClick={deleteSelected}><Trash2 size={17}/> Delete</button>
               <button className="tool-with-label" onClick={duplicateSelected}><Copy size={17}/> Duplicate</button>
               <button className={`tool-with-label ${snap ? 'is-on' : ''}`} onClick={() => setSnap(v => !v)}>Snap</button>
@@ -798,6 +809,7 @@ export function CJCutEditor({
               <ZoomOut size={16}/><input type="range" min=".5" max="3" step=".1" value={zoom} onChange={e => setZoom(+e.target.value)}/><ZoomIn size={16}/>
             </div>
           </div>
+          {editNotice && <div className="timeline-edit-notice" role="status">{editNotice}<button type="button" aria-label="Dismiss editing message" onClick={() => setEditNotice('')}>×</button></div>}
           <div className="timeline-scroll" ref={timelineRef}>
             <div className="timeline-inner" style={{ width: 190 + project.duration * pxPerSecond + 120 }}>
               <div className="ruler-row timeline-scrub-zone"
@@ -833,7 +845,7 @@ export function CJCutEditor({
                         onPointerDown={e => beginClipDrag(e, clip, 'move')}
                         onPointerMove={moveClipDrag}
                         onPointerUp={endClipDrag}
-                        onDoubleClick={() => { setPlayhead(clip.start); setSelectedClipId(clip.id) }}>
+                        onDoubleClick={() => { setPlaying(false); setPlayhead(clip.start + clip.duration / 2); setSelectedClipId(clip.id); setEditNotice('') }}>
                         <div className="trim-handle left" onPointerDown={e => beginClipDrag(e,clip,'trim-left')}/>
                         <div className="clip-content">
                           {clip.type === 'audio' ? <Wave/> : clip.type === 'text' ? <Type size={14}/> : clip.type === 'image' ? <ImageIcon size={14}/> : <Film size={14}/>}
