@@ -30,6 +30,10 @@
       "types": "./dist-plugin/plugin.d.ts",
       "import": "./dist-plugin/plugin.js"
     },
-    "./styles.css": "./dist-plugin/styles.css"
+    "./styles.css": "./dist-plugin/styles.css",
+    "./timeline": {
+      "types": "./dist-plugin/timeline-operations.d.ts",
+      "import": "./dist-plugin/timeline-operations.js"
+    }
   }
 }
