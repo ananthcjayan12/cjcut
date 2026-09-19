@@ -5,11 +5,12 @@ import {
   Unlock, Upload, Volume2, ZoomIn, ZoomOut
 } from 'lucide-react'
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { splitTimelineClip } from './timeline-operations'
 
-type TrackType = 'video' | 'image' | 'audio' | 'text'
-type MediaKind = Exclude<TrackType, 'text'>
+export type TrackType = 'video' | 'image' | 'audio' | 'text'
+export type MediaKind = Exclude<TrackType, 'text'>
 
-type MediaAsset = {
+export type MediaAsset = {
   id: string
   name: string
   kind: MediaKind
@@ -19,7 +20,7 @@ type MediaAsset = {
   height?: number
 }
 
-type Clip = {
+export type Clip = {
   id: string
   trackId: string
   type: TrackType
@@ -38,24 +39,39 @@ type Clip = {
   opacity: number
   volume: number
   speed: number
+  externalId?: string
+  role?: 'base' | 'broll' | 'caption' | 'audio' | 'overlay'
+  metadata?: Record<string, string | number | boolean | null | undefined>
 }
 
-type Track = {
+export type Track = {
   id: string
   name: string
   type: TrackType
   visible: boolean
   locked: boolean
   clips: Clip[]
+  externalId?: string
+  role?: 'base' | 'broll' | 'caption' | 'audio' | 'overlay'
 }
 
-type Project = {
+export type Project = {
   name: string
   width: number
   height: number
   fps: number
   duration: number
   tracks: Track[]
+}
+
+export type CJCutEditorProps = {
+  initialProject?: Project
+  projectKey?: string
+  embedded?: boolean
+  brandName?: string
+  allowMediaImport?: boolean
+  onProjectChange?: (project: Project) => void
+  onSave?: (project: Project) => void
 }
 
 type DragState = {
@@ -72,7 +88,7 @@ type DragState = {
 const uid = () => Math.random().toString(36).slice(2, 10)
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 
-const START_PROJECT: Project = {
+export const START_PROJECT: Project = {
   name: 'My Project',
   width: 1920,
   height: 1080,
@@ -125,11 +141,20 @@ function formatTime(seconds: number) {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(frames).padStart(2, '0')}`
 }
 
-function App() {
-  const [project, setProject] = useState<Project>(START_PROJECT)
+export function CJCutEditor({
+  initialProject,
+  projectKey = 'standalone',
+  embedded = false,
+  brandName = 'CJCut',
+  allowMediaImport = true,
+  onProjectChange,
+  onSave,
+}: CJCutEditorProps = {}) {
+  const [project, setProject] = useState<Project>(() => clone(initialProject ?? START_PROJECT))
   const [media, setMedia] = useState<MediaAsset[]>([])
-  const [selectedClipId, setSelectedClipId] = useState<string | null>('welcome-title')
-  const [playhead, setPlayhead] = useState(2.2)
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(initialProject ? null : 'welcome-title')
+  const [playhead, setPlayhead] = useState(initialProject ? 0 : 2.2)
+  const [editNotice, setEditNotice] = useState('')
   const [playing, setPlaying] = useState(false)
   const [zoom, setZoom] = useState(1)
   const [snap, setSnap] = useState(true)
@@ -146,6 +171,27 @@ function App() {
   const projectInputRef = useRef<HTMLInputElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
   const previewRefs = useRef<Record<string, HTMLVideoElement | HTMLAudioElement | null>>({})
+  const loadedProjectKeyRef = useRef(projectKey)
+  const onProjectChangeRef = useRef(onProjectChange)
+  const onSaveRef = useRef(onSave)
+
+  useEffect(() => { onProjectChangeRef.current = onProjectChange }, [onProjectChange])
+  useEffect(() => { onSaveRef.current = onSave }, [onSave])
+  useEffect(() => {
+    if (!initialProject || loadedProjectKeyRef.current === projectKey) return
+    loadedProjectKeyRef.current = projectKey
+    setProject(clone(initialProject))
+    setSelectedClipId(null)
+    setPlayhead(0)
+    setEditNotice('')
+    setPlaying(false)
+    setPast([])
+    setFuture([])
+  }, [initialProject, projectKey])
+  useEffect(() => {
+    onProjectChangeRef.current?.(clone(project))
+  }, [project])
+
 
   const pxPerSecond = 44 * zoom
   const selected = useMemo(() => {
@@ -239,28 +285,27 @@ function App() {
   }
 
   const splitSelected = () => {
-    if (!selected) return
-    if (playhead <= selected.start + 0.05 || playhead >= selected.start + selected.duration - 0.05) return
-    commit(p => {
-      const track = p.tracks.find(t => t.id === selected.trackId)
-      if (!track || track.locked) return p
-      const original = track.clips.find(c => c.id === selected.id)
-      if (!original) return p
-      const leftDuration = playhead - original.start
-      const rightDuration = original.duration - leftDuration
-      const right: Clip = {
-        ...clone(original),
-        id: uid(),
-        name: original.name + ' cut',
-        start: playhead,
-        duration: rightDuration,
-        sourceStart: original.sourceStart + leftDuration * original.speed,
-      }
-      original.duration = leftDuration
-      track.clips.push(right)
-      setSelectedClipId(right.id)
-      return p
-    })
+    // A scrub can move the playhead away from a previously selected clip. In
+    // that case cut the topmost unlocked clip under the playhead instead.
+    const containsPlayhead = (clip: Clip) =>
+      playhead > clip.start + 0.05 && playhead < clip.start + clip.duration - 0.05
+    const selectedTrack = project.tracks.find(track => track.id === selected?.trackId)
+    const target = selected && selectedTrack?.visible && !selectedTrack.locked && containsPlayhead(selected)
+      ? selected
+      : project.tracks
+        .filter(track => track.visible && !track.locked)
+        .flatMap(track => track.clips)
+        .find(containsPlayhead) ?? selected
+    const result = splitTimelineClip(project, target?.id ?? null, playhead, uid())
+    if (!result.ok) {
+      setEditNotice(result.reason)
+      return
+    }
+    setPlaying(false)
+    pushSnapshot(project)
+    setProject(result.project)
+    setSelectedClipId(result.rightId)
+    setEditNotice('Clip split at playhead. You can move or trim either half independently.')
   }
 
   const duplicateSelected = () => {
@@ -347,10 +392,19 @@ function App() {
     })
   }
 
-  const endClipDrag = () => {
+  const endClipDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
     if (!drag) return
-    pushSnapshot(drag.snapshot)
+    if (drag.mode === 'move' && Math.abs(event.clientX - drag.startX) <= 3) {
+      // A click selects the clip AND seeks within it, as in a normal NLE.
+      // Previously it only selected; Split then silently did nothing because
+      // the playhead was somewhere else.
+      setPlaying(false)
+      setPlayheadFromClientX(event.clientX)
+      setEditNotice('')
+    } else {
+      pushSnapshot(drag.snapshot)
+    }
     dragRef.current = null
   }
 
@@ -580,9 +634,17 @@ function App() {
     })
   }
 
-  const exportProject = () => {
+  const serializableProject = () => {
     const clean = clone(project)
     clean.tracks.forEach(t => t.clips.forEach(c => { if (c.url?.startsWith('blob:')) delete c.url }))
+    return clean
+  }
+
+  const saveToHost = () => onSaveRef.current?.(serializableProject())
+
+  const exportProject = () => {
+    const clean = serializableProject()
+    onSaveRef.current?.(clean)
     const blob = new Blob([JSON.stringify(clean, null, 2)], { type: 'application/json' })
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
@@ -615,15 +677,17 @@ function App() {
   }, [project.duration, zoom])
 
   return (
+    <div className={`cjcut-editor ${embedded ? 'embedded' : 'standalone'}`}>
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><div className="brand-mark">C</div><strong>CJCut</strong></div>
+        <div className="brand"><div className="brand-mark">C</div><strong>{brandName}</strong></div>
         <nav className="menu"><button>File</button><button>Edit</button><button>View</button><button>Help</button></nav>
         <div className="project-title"><span>{project.name}</span><ChevronDown size={14}/></div>
         <div className="top-actions">
           <button className="icon-btn" onClick={undo} disabled={!past.length} title="Undo (Ctrl/Cmd+Z)"><Undo2 size={18}/></button>
           <button className="icon-btn" onClick={redo} disabled={!future.length} title="Redo (Ctrl/Cmd+Shift+Z)"><Redo2 size={18}/></button>
           <button className="ratio-btn" title="Project resolution detected from the primary video"><Maximize2 size={15}/> {project.width}×{project.height}</button>
+          {onSave && <button className="host-save-btn" onClick={saveToHost}>Save</button>}
           <button className="export-btn" onClick={() => setShowExport(true)}><Download size={17}/> Export</button>
           <button className="icon-btn"><Settings2 size={18}/></button>
         </div>
@@ -640,10 +704,12 @@ function App() {
           <div className="asset-panel">
             {leftTab === 'media' && <>
               <div className="panel-tabs"><button className="active">Import</button><button>Record</button><button>Stock</button></div>
-              <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
-                <Upload size={25}/><strong>Import Media</strong><span>Videos, images or audio</span>
-              </button>
-              <input ref={fileInputRef} hidden type="file" multiple accept="video/*,audio/*,image/*" onChange={importMedia}/>
+              {allowMediaImport ? <>
+                <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
+                  <Upload size={25}/><strong>Import Media</strong><span>Videos, images or audio</span>
+                </button>
+                <input ref={fileInputRef} hidden type="file" multiple accept="video/*,audio/*,image/*" onChange={importMedia}/>
+              </> : <div className="host-media-note"><strong>Project media is managed by the host app.</strong><span>Move, trim, split, hide or remove the supplied clips directly on the timeline.</span></div>}
               <div className="asset-filter"><button className="active">All</button><button>Video</button><button>Image</button><button>Audio</button></div>
               <div className="asset-grid">
                 {media.length === 0 && <div className="empty-assets">Your imported media will appear here.</div>}
@@ -667,7 +733,7 @@ function App() {
             </div>}
             {leftTab === 'audio' && <div className="simple-panel">
               <h3>Audio</h3><p>Import music or narration, then click it to add it to the timeline.</p>
-              <button className="primary-wide" onClick={() => fileInputRef.current?.click()}><Upload size={17}/> Import audio</button>
+              {allowMediaImport && <button className="primary-wide" onClick={() => fileInputRef.current?.click()}><Upload size={17}/> Import audio</button>}
             </div>}
           </div>
         </aside>
@@ -734,7 +800,7 @@ function App() {
               <button onClick={undo} title="Undo"><Undo2 size={17}/></button>
               <button onClick={redo} title="Redo"><Redo2 size={17}/></button>
               <span className="divider"/>
-              <button className="tool-with-label" onClick={splitSelected}><Scissors size={17}/> Split <kbd>Ctrl+B</kbd></button>
+              <button className="tool-with-label" onClick={splitSelected} title="Select a clip, position the playhead inside it, then split. Shortcut: Ctrl/Cmd+B"><Scissors size={17}/> Split <kbd>Ctrl+B</kbd></button>
               <button className="tool-with-label" onClick={deleteSelected}><Trash2 size={17}/> Delete</button>
               <button className="tool-with-label" onClick={duplicateSelected}><Copy size={17}/> Duplicate</button>
               <button className={`tool-with-label ${snap ? 'is-on' : ''}`} onClick={() => setSnap(v => !v)}>Snap</button>
@@ -743,6 +809,7 @@ function App() {
               <ZoomOut size={16}/><input type="range" min=".5" max="3" step=".1" value={zoom} onChange={e => setZoom(+e.target.value)}/><ZoomIn size={16}/>
             </div>
           </div>
+          {editNotice && <div className="timeline-edit-notice" role="status">{editNotice}<button type="button" aria-label="Dismiss editing message" onClick={() => setEditNotice('')}>×</button></div>}
           <div className="timeline-scroll" ref={timelineRef}>
             <div className="timeline-inner" style={{ width: 190 + project.duration * pxPerSecond + 120 }}>
               <div className="ruler-row timeline-scrub-zone"
@@ -778,7 +845,7 @@ function App() {
                         onPointerDown={e => beginClipDrag(e, clip, 'move')}
                         onPointerMove={moveClipDrag}
                         onPointerUp={endClipDrag}
-                        onDoubleClick={() => { setPlayhead(clip.start); setSelectedClipId(clip.id) }}>
+                        onDoubleClick={() => { setPlaying(false); setPlayhead(clip.start + clip.duration / 2); setSelectedClipId(clip.id); setEditNotice('') }}>
                         <div className="trim-handle left" onPointerDown={e => beginClipDrag(e,clip,'trim-left')}/>
                         <div className="clip-content">
                           {clip.type === 'audio' ? <Wave/> : clip.type === 'text' ? <Type size={14}/> : clip.type === 'image' ? <ImageIcon size={14}/> : <Film size={14}/>}
@@ -818,7 +885,12 @@ function App() {
         </div>
       </div>}
     </div>
+    </div>
   )
+}
+
+function App() {
+  return <CJCutEditor />
 }
 
 function Range({label,min,max,step,value,suffix,onChange}:{label:string,min:number,max:number,step:number,value:number,suffix:string,onChange:(v:number)=>void}) {
