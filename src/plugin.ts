@@ -9,3 +9,6 @@ export type {
   MediaKind as CJCutMediaKind,
   MediaAsset as CJCutMediaAsset,
 } from './App'
+
+export { splitTimelineClip } from './timeline-operations'
+export type { TimelineSplitResult } from './timeline-operations'
