@@ -192,3 +192,34 @@
 .cjcut-editor .track-actions button:disabled{opacity:.24;cursor:not-allowed}
 .cjcut-editor .track-actions button[title^="Delete"]:hover:not(:disabled){color:#fda4af;background:#451a1a}
 @media(max-width:1080px){.cjcut-editor .timeline-toolbar{height:auto;min-height:46px;flex-wrap:wrap;gap:6px;padding:7px}.cjcut-editor .zoom-tools{min-width:200px}}
+
+/* Layer order and non-destructive audio editing */
+.cjcut-editor .track-label { flex-direction:column; justify-content:center; gap:2px; padding:2px 5px; }
+.cjcut-editor .track-label-main { width:100%; min-width:0; display:flex; align-items:center; gap:3px; }
+.cjcut-editor .track-label-main > strong { min-width:0; flex:1; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; cursor:pointer; }
+.cjcut-editor .track-label-main .track-icon svg { width:13px; height:13px; }
+.cjcut-editor .track-actions { flex:0 0 auto; display:flex; gap:0; }
+.cjcut-editor .track-actions button { width:18px; height:20px; }
+.cjcut-editor .track-actions svg { width:11px; height:11px; }
+.cjcut-editor .track-actions button:disabled { opacity:.2; cursor:default; }
+.cjcut-editor .track-selected { background:#163044; }
+.cjcut-editor .track-volume-bar { display:flex; align-items:center; gap:5px; width:100%; height:22px; }
+.cjcut-editor .track-volume-bar button { flex:0 0 18px; display:grid; place-items:center; padding:0; color:#a5b4fc; }
+.cjcut-editor .track-volume-bar svg { width:13px; height:13px; }
+.cjcut-editor .track-volume-bar input[type="range"] { width:100%; min-width:30px; accent-color:#38bdf8; }
+.cjcut-editor .track-volume-bar small { font-size:9px; flex:0 0 27px; text-align:right; color:#a5b4fc; }
+.cjcut-editor .property-section .audio-track-gain { font-size:10px; line-height:1.45; color:#a1a1aa; margin:5px 0 12px; }
+.cjcut-editor .audio-automation { border:1px solid #303c4c; border-radius:8px; margin:13px 0; padding:10px; }
+.cjcut-editor .audio-automation-head { display:flex; gap:7px; justify-content:space-between; align-items:center; }
+.cjcut-editor .audio-automation-head strong { font-size:11px; }
+.cjcut-editor .audio-automation-head button { background:#204564; border-radius:5px; padding:6px; color:#dbeafe; font-size:10px; text-align:center; }
+.cjcut-editor .audio-automation-head button:disabled { opacity:.35; }
+.cjcut-editor .audio-automation > small { display:block; color:#94a3b8; font-size:10px; line-height:1.5; margin:8px 0; }
+.cjcut-editor .audio-keyframe-row { display:grid; grid-template-columns:63px minmax(22px,1fr) 30px 15px; align-items:center; gap:4px; margin:7px 0; font-size:10px; }
+.cjcut-editor .audio-keyframe-row label { display:flex; gap:3px; align-items:center; }
+.cjcut-editor .audio-keyframe-row label input { width:36px; min-width:0; font-size:10px; background:#22272e; color:#f8fafc; border:1px solid #334155; }
+.cjcut-editor .audio-keyframe-row input[type="range"] { width:100%; accent-color:#38bdf8; }
+.cjcut-editor .audio-keyframe-row > span { font-size:10px; color:#a5b4fc; }
+.cjcut-editor .audio-keyframe-row > button { font-size:16px; color:#fca5a5; }
+.cjcut-editor .clip-gain-points { position:absolute; bottom:0; left:0; right:0; pointer-events:none; height:25px; }
+.cjcut-editor .clip-gain-points span { width:6px; height:6px; border:1px solid #f8fafc; border-radius:50%; background:#38bdf8; position:absolute; transform:translateX(-50%); }
