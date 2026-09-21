@@ -1,12 +1,14 @@
 {
-  "name": "cjcut",
-  "private": true,
-  "version": "0.1.0",
+  "name": "@cjcut/editor",
+  "private": false,
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:plugin": "tsc -p tsconfig.plugin.json && node -e \"require('node:fs').copyFileSync('src/styles.css','dist-plugin/styles.css')\"",
+    "prepare": "npm run build:plugin"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.2",
@@ -19,5 +21,23 @@
     "@types/react": "^19.1.13",
     "@types/react-dom": "^19.1.9",
     "typescript": "^5.9.2"
+  },
+  "main": "./dist-plugin/plugin.js",
+  "module": "./dist-plugin/plugin.js",
+  "types": "./dist-plugin/plugin.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-plugin/plugin.d.ts",
+      "import": "./dist-plugin/plugin.js"
+    },
+    "./styles.css": "./dist-plugin/styles.css",
+    "./timeline": {
+      "types": "./dist-plugin/timeline-operations.d.ts",
+      "import": "./dist-plugin/timeline-operations.js"
+    },
+    "./audio": {
+      "types": "./dist-plugin/audio-automation.d.ts",
+      "import": "./dist-plugin/audio-automation.js"
+    }
   }
 }

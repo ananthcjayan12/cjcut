@@ -1,15 +1,17 @@
 import {
-  ChevronDown, Copy, Download, Eye, EyeOff, Film, FolderOpen, Image as ImageIcon,
+  ArrowDown, ArrowUp, ChevronDown, Copy, Download, Eye, EyeOff, Film, FolderOpen, Image as ImageIcon,
   Layers3, Lock, Maximize2, Music2, Pause, Play, Plus, Redo2, RotateCcw,
   Scissors, Settings2, SkipBack, SkipForward, Sparkles, Trash2, Type, Undo2,
-  Unlock, Upload, Volume2, ZoomIn, ZoomOut
+  Unlock, Upload, Volume2, VolumeX, ZoomIn, ZoomOut
 } from 'lucide-react'
-import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { splitTimelineClip } from './timeline-operations'
+import { volumeEnvelopeAt, unit, type AudioKeyframe } from './audio-automation'
 
-type TrackType = 'video' | 'image' | 'audio' | 'text'
-type MediaKind = Exclude<TrackType, 'text'>
+export type TrackType = 'video' | 'image' | 'audio' | 'text'
+export type MediaKind = Exclude<TrackType, 'text'>
 
-type MediaAsset = {
+export type MediaAsset = {
   id: string
   name: string
   kind: MediaKind
@@ -17,9 +19,14 @@ type MediaAsset = {
   duration: number
   width?: number
   height?: number
+  externalId?: string
+  role?: Clip['role']
+  metadata?: Clip['metadata']
+  sourceStart?: number
+  sourceDuration?: number
 }
 
-type Clip = {
+export type Clip = {
   id: string
   trackId: string
   type: TrackType
@@ -37,25 +44,48 @@ type Clip = {
   rotation: number
   opacity: number
   volume: number
+  fadeIn?: number
+  fadeOut?: number
+  volumeKeyframes?: AudioKeyframe[]
   speed: number
+  externalId?: string
+  role?: 'base' | 'broll' | 'caption' | 'audio' | 'overlay'
+  metadata?: Record<string, string | number | boolean | null | undefined>
 }
 
-type Track = {
+export type Track = {
   id: string
   name: string
   type: TrackType
   visible: boolean
   locked: boolean
+  volume?: number
+  muted?: boolean
   clips: Clip[]
+  externalId?: string
+  role?: 'base' | 'broll' | 'caption' | 'audio' | 'overlay'
 }
 
-type Project = {
+export type Project = {
   name: string
   width: number
   height: number
   fps: number
   duration: number
   tracks: Track[]
+  suppressedManagedTrackIds?: string[]
+}
+
+export type CJCutEditorProps = {
+  initialProject?: Project
+  projectKey?: string
+  embedded?: boolean
+  brandName?: string
+  allowMediaImport?: boolean
+  hostMedia?: MediaAsset[]
+  onImportFiles?: (files: File[]) => Promise<void> | void
+  onProjectChange?: (project: Project) => void
+  onSave?: (project: Project) => void
 }
 
 type DragState = {
@@ -72,7 +102,7 @@ type DragState = {
 const uid = () => Math.random().toString(36).slice(2, 10)
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 
-const START_PROJECT: Project = {
+export const START_PROJECT: Project = {
   name: 'My Project',
   width: 1920,
   height: 1080,
@@ -125,13 +155,28 @@ function formatTime(seconds: number) {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(frames).padStart(2, '0')}`
 }
 
-function App() {
-  const [project, setProject] = useState<Project>(START_PROJECT)
+export function CJCutEditor({
+  initialProject,
+  projectKey = 'standalone',
+  embedded = false,
+  brandName = 'CJCut',
+  allowMediaImport = true,
+  hostMedia = [],
+  onImportFiles,
+  onProjectChange,
+  onSave,
+}: CJCutEditorProps = {}) {
+  const [project, setProject] = useState<Project>(() => clone(initialProject ?? START_PROJECT))
   const [media, setMedia] = useState<MediaAsset[]>([])
-  const [selectedClipId, setSelectedClipId] = useState<string | null>('welcome-title')
-  const [playhead, setPlayhead] = useState(2.2)
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(initialProject ? null : 'welcome-title')
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null)
+  const [playhead, setPlayhead] = useState(initialProject ? 0 : 2.2)
+  const [editNotice, setEditNotice] = useState('')
   const [playing, setPlaying] = useState(false)
   const [zoom, setZoom] = useState(1)
+  const [draggingAssetId, setDraggingAssetId] = useState<string | null>(null)
+  const [isTimelineDropTarget, setIsTimelineDropTarget] = useState(false)
+  const [dropTargetTrackId, setDropTargetTrackId] = useState<string | null>(null)
   const [snap, setSnap] = useState(true)
   const [leftTab, setLeftTab] = useState<'media' | 'text' | 'audio'>('media')
   const [past, setPast] = useState<Project[]>([])
@@ -145,9 +190,100 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const projectInputRef = useRef<HTMLInputElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
+  const pendingZoomAnchor = useRef<{ time: number; viewportX: number } | null>(null)
+  const zoomInitializedRef = useRef(false)
   const previewRefs = useRef<Record<string, HTMLVideoElement | HTMLAudioElement | null>>({})
+  const mediaRefHandlers = useRef<Record<string, (node: HTMLVideoElement | HTMLAudioElement | null) => void>>({})
+  const activePlaybackIds = useRef(new Set<string>())
+  const playheadNow = useRef(playhead)
+  const loadedProjectKeyRef = useRef(projectKey)
+  const externalProjectRef = useRef(initialProject)
+  const onProjectChangeRef = useRef(onProjectChange)
+  const onSaveRef = useRef(onSave)
+
+  useEffect(() => { onProjectChangeRef.current = onProjectChange }, [onProjectChange])
+  useEffect(() => { onSaveRef.current = onSave }, [onSave])
+  useEffect(() => {
+    if (!initialProject) return
+    if (loadedProjectKeyRef.current === projectKey && externalProjectRef.current === initialProject) return
+    // The host sends a new projectKey BEFORE its async asset reconciliation
+    // finishes. Wait for the corresponding new project object; otherwise the
+    // stale first render wins and fresh B-roll never appears.
+    if (loadedProjectKeyRef.current !== projectKey && externalProjectRef.current === initialProject) return
+    externalProjectRef.current = initialProject
+    loadedProjectKeyRef.current = projectKey
+    setProject(clone(initialProject))
+    setSelectedClipId(null)
+    setSelectedTrackId(null)
+    activePlaybackIds.current.clear()
+    setPlayhead(time => Math.min(time, initialProject.duration))
+    setEditNotice('')
+    setPlaying(false)
+    setPast([])
+    setFuture([])
+  }, [initialProject, projectKey])
+  useEffect(() => {
+    onProjectChangeRef.current?.(clone(project))
+  }, [project])
+
 
   const pxPerSecond = 44 * zoom
+  const assetLibrary = useMemo(() => {
+    const existing = new Set<string>()
+    return [...hostMedia, ...media].filter(asset => {
+      if (existing.has(asset.id)) return false
+      existing.add(asset.id)
+      return true
+    })
+  }, [hostMedia, media])
+
+  const setTimelineZoom = (requested: number, cursorX?: number) => {
+    const timeline = timelineRef.current
+    const next = Math.max(0.001, Math.min(64, requested))
+    if (timeline && Math.abs(next - zoom) > 0.000001) {
+      const rect = timeline.getBoundingClientRect()
+      const viewportX = Math.max(190, Math.min(timeline.clientWidth, cursorX === undefined ? timeline.clientWidth / 2 : cursorX - rect.left))
+      const time = Math.max(0, (timeline.scrollLeft + viewportX - 190) / pxPerSecond)
+      pendingZoomAnchor.current = { time, viewportX }
+    }
+    setZoom(next)
+  }
+
+  useLayoutEffect(() => {
+    const anchor = pendingZoomAnchor.current
+    const timeline = timelineRef.current
+    if (!anchor || !timeline) return
+    timeline.scrollLeft = Math.max(0, 190 + anchor.time * pxPerSecond - anchor.viewportX)
+    pendingZoomAnchor.current = null
+  }, [zoom, pxPerSecond])
+
+  const fitTimeline = () => {
+    const viewport = timelineRef.current?.clientWidth ?? 1000
+    const usable = Math.max(140, viewport - 214)
+    setTimelineZoom(Math.max(0.001, Math.min(64, usable / Math.max(1, project.duration) / 44)))
+    if (timelineRef.current) timelineRef.current.scrollLeft = 0
+  }
+
+  useEffect(() => {
+    if (zoomInitializedRef.current) return
+    const timeline = timelineRef.current
+    if (!timeline) return
+    zoomInitializedRef.current = true
+    const usable = Math.max(140, timeline.clientWidth - 214)
+    setZoom(Math.max(0.001, Math.min(64, usable / Math.max(1, project.duration) / 44)))
+  }, [project.duration])
+
+  const onTimelineWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      event.preventDefault()
+      setTimelineZoom(zoom * Math.exp(-event.deltaY * 0.004), event.clientX)
+    } else if (event.shiftKey && timelineRef.current) {
+      event.preventDefault()
+      timelineRef.current.scrollLeft += event.deltaY + event.deltaX
+    }
+    // Unmodified wheel scrolls vertically; horizontal trackpad scrolls natively.
+  }
+
   const selected = useMemo(() => {
     for (const track of project.tracks) {
       const found = track.clips.find(c => c.id === selectedClipId)
@@ -155,6 +291,20 @@ function App() {
     }
     return null
   }, [project, selectedClipId])
+
+  const selectedTrack = project.tracks.find(t => t.id === (selected?.trackId ?? selectedTrackId)) ?? null
+  const trackForClip = (clip: Clip) => project.tracks.find(t => t.id === clip.trackId)
+  const effectiveVolume = (clip: Clip, localSeconds: number) => {
+    const track = trackForClip(clip)
+    return track?.muted ? 0 : unit(unit(track?.volume ?? 1) * unit(clip.volume) * volumeEnvelopeAt(clip, localSeconds, clip.duration))
+  }
+  const bindMediaRef = (id: string) => {
+    if (!mediaRefHandlers.current[id]) mediaRefHandlers.current[id] = node => {
+      if (node) previewRefs.current[id] = node
+      else delete previewRefs.current[id]
+    }
+    return mediaRefHandlers.current[id]
+  }
 
   const visibleClips = useMemo(() =>
     project.tracks
@@ -239,28 +389,27 @@ function App() {
   }
 
   const splitSelected = () => {
-    if (!selected) return
-    if (playhead <= selected.start + 0.05 || playhead >= selected.start + selected.duration - 0.05) return
-    commit(p => {
-      const track = p.tracks.find(t => t.id === selected.trackId)
-      if (!track || track.locked) return p
-      const original = track.clips.find(c => c.id === selected.id)
-      if (!original) return p
-      const leftDuration = playhead - original.start
-      const rightDuration = original.duration - leftDuration
-      const right: Clip = {
-        ...clone(original),
-        id: uid(),
-        name: original.name + ' cut',
-        start: playhead,
-        duration: rightDuration,
-        sourceStart: original.sourceStart + leftDuration * original.speed,
-      }
-      original.duration = leftDuration
-      track.clips.push(right)
-      setSelectedClipId(right.id)
-      return p
-    })
+    // A scrub can move the playhead away from a previously selected clip. In
+    // that case cut the topmost unlocked clip under the playhead instead.
+    const containsPlayhead = (clip: Clip) =>
+      playhead > clip.start + 0.05 && playhead < clip.start + clip.duration - 0.05
+    const selectedTrack = project.tracks.find(track => track.id === selected?.trackId)
+    const target = selected && selectedTrack?.visible && !selectedTrack.locked && containsPlayhead(selected)
+      ? selected
+      : project.tracks
+        .filter(track => track.visible && !track.locked)
+        .flatMap(track => track.clips)
+        .find(containsPlayhead) ?? selected
+    const result = splitTimelineClip(project, target?.id ?? null, playhead, uid())
+    if (!result.ok) {
+      setEditNotice(result.reason)
+      return
+    }
+    setPlaying(false)
+    pushSnapshot(project)
+    setProject(result.project)
+    setSelectedClipId(result.rightId)
+    setEditNotice('Clip split at playhead. You can move or trim either half independently.')
   }
 
   const duplicateSelected = () => {
@@ -347,10 +496,19 @@ function App() {
     })
   }
 
-  const endClipDrag = () => {
+  const endClipDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
     if (!drag) return
-    pushSnapshot(drag.snapshot)
+    if (drag.mode === 'move' && Math.abs(event.clientX - drag.startX) <= 3) {
+      // A click selects the clip AND seeks within it, as in a normal NLE.
+      // Previously it only selected; Split then silently did nothing because
+      // the playhead was somewhere else.
+      setPlaying(false)
+      setPlayheadFromClientX(event.clientX)
+      setEditNotice('')
+    } else {
+      pushSnapshot(drag.snapshot)
+    }
     dragRef.current = null
   }
 
@@ -410,50 +568,81 @@ function App() {
     }
   }, [playing, project.duration])
 
-  // Keep media playback continuous. Re-seeking a <video>/<audio> element on every
-  // animation frame forces the browser decoder to flush repeatedly and causes
-  // visible frame stalls and distorted/choppy audio.
+  // The preview clock belongs to the timeline, not to an individual audio
+  // element. Starting/importing a new audio clip must never re-seek or pause a
+  // video that was already playing. Only newly active media is synchronized.
+  const initializedMedia = useRef(new WeakMap<HTMLMediaElement, string>())
+  playheadNow.current = playhead
+
+  const updateElementGain = (clip: Clip, element: HTMLMediaElement, at: number) => {
+    const gain = effectiveVolume(clip, at - clip.start)
+    element.volume = gain
+    element.muted = gain <= 0.000001
+    element.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
+  }
+
+  const startMedia = (clip: Clip) => {
+    const el = previewRefs.current[clip.id]
+    if (!el || !playing) return
+    const source = el.currentSrc || el.src
+    if (initializedMedia.current.get(el) !== source || !activePlaybackIds.current.has(clip.id)) {
+      const target = clip.sourceStart + (playheadNow.current - clip.start) * clip.speed
+      try { el.currentTime = Math.max(0, target) } catch { /* wait for metadata */ }
+      initializedMedia.current.set(el, source)
+    }
+    updateElementGain(clip, el, playheadNow.current)
+    if (el.paused) void el.play().catch(error => {
+      // NotAllowedError means the browser needs a user gesture; the transport
+      // button already supplies one on desktop. Do not pause other media.
+      if (error?.name !== 'AbortError') setEditNotice('Could not start ' + clip.name + ': ' + (error?.message || 'browser playback blocked'))
+    })
+  }
+
   useEffect(() => {
-    if (!playing) return
-
-    const activeIds = new Set(activeMediaKey ? activeMediaKey.split('|') : [])
-    Object.entries(previewRefs.current).forEach(([id, element]) => {
-      if (element && !activeIds.has(id)) element.pause()
-    })
-
+    if (!playing) {
+      Object.values(previewRefs.current).forEach(el => el?.pause())
+      activePlaybackIds.current.clear()
+      return
+    }
+    const active = new Set(activeMediaKey ? activeMediaKey.split('|') : [])
+    for (const id of activePlaybackIds.current) {
+      if (!active.has(id)) previewRefs.current[id]?.pause()
+    }
     visibleClips.forEach(({ clip }) => {
-      if (!clip.url || (clip.type !== 'video' && clip.type !== 'audio')) return
-      const el = previewRefs.current[clip.id]
-      if (!el) return
-
-      const target = clip.sourceStart + (playhead - clip.start) * clip.speed
-      try { el.currentTime = Math.max(0, target) } catch { /* metadata may still be loading */ }
-      el.volume = Math.max(0, Math.min(1, clip.volume))
-      el.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
-      el.play().catch(() => undefined)
+      if (active.has(clip.id)) startMedia(clip)
     })
-    // Sync once when playback starts or the active clip set changes. From there,
-    // the browser media clock is allowed to run without repeated seeks.
+    activePlaybackIds.current = active
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing, activeMediaKey])
 
-  // While paused/scrubbing we do want frame-accurate seeking so the preview
-  // follows the playhead immediately.
+  // Gain automation is lightweight: update volume each preview frame, but let
+  // the browser video/audio clocks run without decoder-flushing seeks.
+  useEffect(() => {
+    if (!playing) return
+    visibleClips.forEach(({ clip }) => {
+      if (clip.type !== 'audio' && clip.type !== 'video') return
+      const el = previewRefs.current[clip.id]
+      if (el) updateElementGain(clip, el, playhead)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playhead, project, playing])
+
+  // Paused scrubbing is the only point at which all visible media is sought.
   useEffect(() => {
     if (playing) return
     visibleClips.forEach(({ clip }) => {
-      if (!clip.url || (clip.type !== 'video' && clip.type !== 'audio')) return
+      if (clip.type !== 'audio' && clip.type !== 'video') return
       const el = previewRefs.current[clip.id]
       if (!el) return
       const target = clip.sourceStart + (playhead - clip.start) * clip.speed
-      if (Math.abs(el.currentTime - target) > 0.015) {
+      if (Math.abs(el.currentTime - target) > 0.025) {
         try { el.currentTime = Math.max(0, target) } catch { /* metadata may still be loading */ }
       }
-      el.volume = Math.max(0, Math.min(1, clip.volume))
-      el.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
+      updateElementGain(clip, el, playhead)
       el.pause()
     })
-  }, [playhead, playing, activeMediaKey, visibleClips])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playhead, playing, activeMediaKey, project])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -505,6 +694,16 @@ function App() {
 
   const importMedia = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = [...(event.target.files ?? [])]
+    event.target.value = ''
+    if (onImportFiles) {
+      try {
+        await onImportFiles(files)
+        setEditNotice('Media imported to project library. Drag it onto the timeline to create a track.')
+      } catch (error) {
+        setEditNotice(error instanceof Error ? error.message : 'Could not import media.')
+      }
+      return
+    }
     const assets: MediaAsset[] = []
     for (const file of files) {
       const kind: MediaKind | null = file.type.startsWith('video/') ? 'video'
@@ -519,7 +718,7 @@ function App() {
     event.target.value = ''
   }
 
-  const addAsset = (asset: MediaAsset) => {
+  const addAsset = (asset: MediaAsset, start = playhead, trackId?: string) => {
     commit(p => {
       const hasPrimaryVideo = p.tracks.some(t => t.type === 'video' && t.clips.length > 0)
       if (asset.kind === 'video' && !hasPrimaryVideo && asset.width && asset.height) {
@@ -527,17 +726,19 @@ function App() {
         p.height = asset.height
       }
 
-      let track = p.tracks.find(t => t.type === asset.kind && !t.locked)
-      if (!track && asset.kind === 'image') track = p.tracks.find(t => t.id === 'overlay')
+      // A new media drop is a new layer by default. Dropping directly onto a
+      // compatible unlocked track can intentionally reuse that track.
+      let track = trackId ? p.tracks.find(t => t.id === trackId && t.type === asset.kind && !t.locked) : undefined
       if (!track) {
-        track = { id: uid(), name: asset.kind + ' ' + (p.tracks.length + 1), type: asset.kind, visible: true, locked: false, clips: [] }
+        track = { id: uid(), name: asset.name, type: asset.kind, visible: true, locked: false, clips: [] }
         p.tracks.unshift(track)
       }
       const clip: Clip = {
         id: uid(), trackId: track.id, type: asset.kind, name: asset.name, mediaId: asset.id, url: asset.url,
-        start: playhead, duration: asset.kind === 'image' ? 5 : asset.duration,
-        sourceStart: 0, sourceDuration: asset.duration,
-        x: 50, y: 50, scale: 1, rotation: 0, opacity: 1, volume: 1, speed: 1,
+        start: Math.max(0, start), duration: asset.kind === 'image' ? Math.min(5, Math.max(0.25, asset.duration)) : asset.duration,
+        sourceStart: asset.sourceStart ?? 0, sourceDuration: asset.sourceDuration ?? asset.duration,
+        externalId: asset.externalId, role: asset.role, metadata: asset.metadata,
+        x: 50, y: 50, scale: 1, rotation: 0, opacity: 1, volume: asset.role === 'broll' ? 0 : 1, speed: 1,
       }
       track.clips.push(clip)
       p.duration = Math.max(p.duration, clip.start + clip.duration + 2)
@@ -564,6 +765,33 @@ function App() {
     })
   }
 
+  const moveTrack = (id: string, direction: -1 | 1) => {
+    const index = project.tracks.findIndex(t => t.id === id)
+    const to = index + direction
+    if (index < 0 || to < 0 || to >= project.tracks.length) return
+    commit(p => {
+      const [track] = p.tracks.splice(index, 1)
+      p.tracks.splice(to, 0, track)
+      return p
+    })
+    setSelectedTrackId(id)
+    setEditNotice('Layer order updated. Higher tracks render above lower tracks.')
+  }
+
+  const updateTrackAudio = (id: string, patch: Partial<Pick<Track, 'volume' | 'muted'>>) => {
+    commit(p => {
+      const track = p.tracks.find(t => t.id === id)
+      if (track && !track.locked) Object.assign(track, patch)
+      return p
+    })
+  }
+
+  const addVolumePoint = (clip: Clip, time: number, gain: number) => {
+    const next = [...(clip.volumeKeyframes ?? []).filter(point => Math.abs(point.time - time) > 0.025), { time, gain: unit(gain) }]
+      .sort((a, b) => a.time - b.time)
+    updateSelected({ volumeKeyframes: next })
+  }
+
   const toggleTrack = (id: string, key: 'visible' | 'locked') => {
     commit(p => {
       const track = p.tracks.find(t => t.id === id)
@@ -580,9 +808,67 @@ function App() {
     })
   }
 
-  const exportProject = () => {
+  const removeTrack = (id: string) => {
+    const track = project.tracks.find(item => item.id === id)
+    if (!track) return
+    if (track.locked) { setEditNotice('Unlock this track before deleting it.'); return }
+    if (track.clips.length && !window.confirm('Delete "' + track.name + '" and all ' + track.clips.length + ' clip(s) on it?')) return
+    commit(p => {
+      const removed = p.tracks.find(item => item.id === id)
+      if (removed?.externalId) p.suppressedManagedTrackIds = [...new Set([...(p.suppressedManagedTrackIds ?? []), removed.externalId])]
+      p.tracks = p.tracks.filter(item => item.id !== id)
+      return p
+    })
+    if (track.clips.some(clip => clip.id === selectedClipId)) setSelectedClipId(null)
+    if (selectedTrackId === id) setSelectedTrackId(null)
+    setEditNotice('Track removed. Undo to restore it.')
+  }
+
+  const beginAssetDrag = (event: ReactDragEvent<HTMLElement>, asset: MediaAsset) => {
+    event.dataTransfer.effectAllowed = 'copy'
+    event.dataTransfer.setData('application/x-cjcut-asset', asset.id)
+    event.dataTransfer.setData('text/plain', asset.name)
+    setDraggingAssetId(asset.id)
+  }
+
+  const acceptAssetDrag = (event: ReactDragEvent<HTMLElement>, trackId: string | null = null) => {
+    if (!event.dataTransfer.types.includes('application/x-cjcut-asset') && !draggingAssetId) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+    setIsTimelineDropTarget(true)
+    setDropTargetTrackId(trackId)
+  }
+
+  const dropAsset = (event: ReactDragEvent<HTMLElement>, trackId: string | null = null) => {
+    const assetId = event.dataTransfer.getData('application/x-cjcut-asset') || draggingAssetId
+    if (!assetId) return
+    event.preventDefault()
+    event.stopPropagation()
+    const asset = assetLibrary.find(item => item.id === assetId)
+    setIsTimelineDropTarget(false)
+    setDropTargetTrackId(null)
+    setDraggingAssetId(null)
+    if (!asset) { setEditNotice('Media item is no longer available.'); return }
+    const timeline = timelineRef.current
+    if (!timeline) return
+    const rect = timeline.getBoundingClientRect()
+    const start = Math.max(0, (event.clientX - rect.left + timeline.scrollLeft - 190) / pxPerSecond)
+    const compatibleTrack = trackId ? project.tracks.find(track => track.id === trackId && track.type === asset.kind && !track.locked) : undefined
+    addAsset(asset, snapTime(start), compatibleTrack?.id)
+    setEditNotice(compatibleTrack ? 'Media added to existing track.' : 'Media added as a new track at the drop position.')
+  }
+
+  const serializableProject = () => {
     const clean = clone(project)
     clean.tracks.forEach(t => t.clips.forEach(c => { if (c.url?.startsWith('blob:')) delete c.url }))
+    return clean
+  }
+
+  const saveToHost = () => onSaveRef.current?.(serializableProject())
+
+  const exportProject = () => {
+    const clean = serializableProject()
+    onSaveRef.current?.(clean)
     const blob = new Blob([JSON.stringify(clean, null, 2)], { type: 'application/json' })
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
@@ -615,15 +901,17 @@ function App() {
   }, [project.duration, zoom])
 
   return (
+    <div className={`cjcut-editor ${embedded ? 'embedded' : 'standalone'}`}>
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><div className="brand-mark">C</div><strong>CJCut</strong></div>
+        <div className="brand"><div className="brand-mark">C</div><strong>{brandName}</strong></div>
         <nav className="menu"><button>File</button><button>Edit</button><button>View</button><button>Help</button></nav>
         <div className="project-title"><span>{project.name}</span><ChevronDown size={14}/></div>
         <div className="top-actions">
           <button className="icon-btn" onClick={undo} disabled={!past.length} title="Undo (Ctrl/Cmd+Z)"><Undo2 size={18}/></button>
           <button className="icon-btn" onClick={redo} disabled={!future.length} title="Redo (Ctrl/Cmd+Shift+Z)"><Redo2 size={18}/></button>
           <button className="ratio-btn" title="Project resolution detected from the primary video"><Maximize2 size={15}/> {project.width}×{project.height}</button>
+          {onSave && <button className="host-save-btn" onClick={saveToHost}>Save</button>}
           <button className="export-btn" onClick={() => setShowExport(true)}><Download size={17}/> Export</button>
           <button className="icon-btn"><Settings2 size={18}/></button>
         </div>
@@ -637,18 +925,21 @@ function App() {
             <button className={leftTab === 'audio' ? 'active' : ''} onClick={() => setLeftTab('audio')}><Music2/><span>Audio</span></button>
             <button><Sparkles/><span>Elements</span></button>
           </div>
+          <input ref={fileInputRef} hidden type="file" multiple accept="video/*,audio/*,image/*" onChange={importMedia}/>
           <div className="asset-panel">
             {leftTab === 'media' && <>
               <div className="panel-tabs"><button className="active">Import</button><button>Record</button><button>Stock</button></div>
-              <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
-                <Upload size={25}/><strong>Import Media</strong><span>Videos, images or audio</span>
-              </button>
-              <input ref={fileInputRef} hidden type="file" multiple accept="video/*,audio/*,image/*" onChange={importMedia}/>
+              {(allowMediaImport || onImportFiles) ? <>
+                <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
+                  <Upload size={25}/><strong>Import Media</strong><span>Videos, images or audio</span>
+                </button>
+
+              </> : <div className="host-media-note"><strong>Project media is managed by the host app.</strong><span>Move, trim, split, hide or remove the supplied clips directly on the timeline.</span></div>}
               <div className="asset-filter"><button className="active">All</button><button>Video</button><button>Image</button><button>Audio</button></div>
               <div className="asset-grid">
-                {media.length === 0 && <div className="empty-assets">Your imported media will appear here.</div>}
-                {media.map(asset => (
-                  <button key={asset.id} className="asset-card" onClick={() => addAsset(asset)} title="Click to add at playhead">
+                {assetLibrary.length === 0 && <div className="empty-assets">No media yet. Generate B-roll or import a file to build your library.</div>}
+                {assetLibrary.map(asset => (
+                  <button key={asset.id} className="asset-card" draggable onDragStart={event => beginAssetDrag(event, asset)} onDragEnd={() => { setDraggingAssetId(null); setIsTimelineDropTarget(false) }} onClick={() => addAsset(asset)} title="Drag onto timeline to create a track, or click to add at playhead">
                     <div className="asset-thumb">
                       {asset.kind === 'image' ? <img src={asset.url}/> :
                        asset.kind === 'video' ? <video src={asset.url}/> : <Music2 size={28}/>}
@@ -667,7 +958,13 @@ function App() {
             </div>}
             {leftTab === 'audio' && <div className="simple-panel">
               <h3>Audio</h3><p>Import music or narration, then click it to add it to the timeline.</p>
-              <button className="primary-wide" onClick={() => fileInputRef.current?.click()}><Upload size={17}/> Import audio</button>
+              {(allowMediaImport || onImportFiles) && <button className="primary-wide" onClick={() => fileInputRef.current?.click()}><Upload size={17}/> Import audio</button>}
+              <div className="asset-grid">
+                {assetLibrary.filter(asset => asset.kind === 'audio').map(asset => <button key={asset.id} className="asset-card" draggable onDragStart={event => beginAssetDrag(event, asset)} onDragEnd={() => setDraggingAssetId(null)} onClick={() => addAsset(asset)} title="Drag to the timeline to add an audio track">
+                  <div className="asset-thumb"><Music2 size={19}/></div>
+                  <strong>{asset.name}</strong><small>{formatTime(asset.duration)}</small>
+                </button>)}
+              </div>
             </div>}
           </div>
         </aside>
@@ -685,13 +982,13 @@ function App() {
                   <div key={clip.id} className={`preview-layer ${clip.type === 'video' || clip.type === 'image' ? 'media-layer' : ''} ${selectedClipId === clip.id ? 'selected' : ''}`}
                     style={{ left: clip.x + '%', top: clip.y + '%', opacity: clip.opacity, transform: `translate(-50%,-50%) scale(${clip.scale}) rotate(${clip.rotation}deg)` }}
                     onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id) }}>
-                    {clip.type === 'video' && clip.url && <video ref={el => { previewRefs.current[clip.id] = el }} src={clip.url} muted={clip.volume === 0} playsInline />}
+                    {clip.type === 'video' && clip.url && <video ref={bindMediaRef(clip.id)} src={clip.url} playsInline preload="auto" onCanPlay={() => startMedia(clip)} />}
                     {clip.type === 'image' && clip.url && <img src={clip.url}/>}
                     {clip.type === 'text' && <div className="preview-text">{clip.text}</div>}
                   </div>
                 ))}
               {visibleClips.filter(({clip}) => clip.type === 'audio' && clip.url).map(({clip}) =>
-                <audio key={clip.id} ref={el => { previewRefs.current[clip.id] = el }} src={clip.url}/>
+                <audio key={clip.id} ref={bindMediaRef(clip.id)} src={clip.url} preload="auto" onCanPlay={() => startMedia(clip)}/>
               )}
             </div>
           </div>
@@ -722,7 +1019,20 @@ function App() {
             </section>}
             {(selected.type === 'video' || selected.type === 'audio') && <section className="property-section">
               <h4><ChevronDown size={15}/> Audio</h4>
-              <Range label="Volume" min={0} max={1} step={0.01} value={selected.volume} suffix={Math.round(selected.volume*100)+'%'} onChange={value => updateSelected({volume:value})}/>
+              <Range label="Clip volume" min={0} max={1} step={0.01} value={selected.volume} suffix={Math.round(selected.volume*100)+'%'} onChange={value => updateSelected({volume:value})}/>
+              {selectedTrack && <p className="audio-track-gain">Track gain: {Math.round((selectedTrack.volume ?? 1)*100)}% {selectedTrack.muted ? '· MUTED' : ''} · Effective: {Math.round(effectiveVolume(selected, playhead-selected.start)*100)}%</p>}
+              <Range label="Fade in" min={0} max={selected.duration} step={0.05} value={Math.min(selected.duration,selected.fadeIn ?? 0)} suffix={(selected.fadeIn ?? 0).toFixed(2)+'s'} onChange={value => updateSelected({fadeIn:value})}/>
+              <Range label="Fade out" min={0} max={selected.duration} step={0.05} value={Math.min(selected.duration,selected.fadeOut ?? 0)} suffix={(selected.fadeOut ?? 0).toFixed(2)+'s'} onChange={value => updateSelected({fadeOut:value})}/>
+              <div className="audio-automation">
+                <div className="audio-automation-head"><strong>Progressive volume</strong><button onClick={() => addVolumePoint(selected, Math.max(0, Math.min(selected.duration, playhead-selected.start)), effectiveVolume(selected, playhead-selected.start)/(unit(selected.volume)*unit(selectedTrack?.volume ?? 1) || 1))} disabled={playhead < selected.start || playhead > selected.start + selected.duration}>+ Keyframe at playhead</button></div>
+                <small>Volume points are relative to this clip. Move the playhead into the clip to add one; drag the slider to create a rise or drop in sound.</small>
+                {(selected.volumeKeyframes ?? []).map((point, idx) => <div className="audio-keyframe-row" key={idx}>
+                  <label>At <input type="number" min={0} max={selected.duration} step={0.05} value={+point.time.toFixed(2)} onChange={e => updateSelected({volumeKeyframes:(selected.volumeKeyframes ?? []).map((p,i) => i===idx ? {...p,time:Math.max(0,Math.min(selected.duration,Number(e.target.value)||0))} : p).sort((a,b)=>a.time-b.time)})}/> s</label>
+                  <input type="range" aria-label={'Volume at '+point.time.toFixed(2)+' seconds'} min={0} max={1} step={0.01} value={point.gain} onChange={e => updateSelected({volumeKeyframes:(selected.volumeKeyframes ?? []).map((p,i) => i===idx ? {...p,gain:Number(e.target.value)} : p)})}/>
+                  <span>{Math.round(point.gain*100)}%</span>
+                  <button title="Delete volume keyframe" aria-label={'Delete keyframe at '+point.time.toFixed(2)+' seconds'} onClick={() => updateSelected({volumeKeyframes:(selected.volumeKeyframes ?? []).filter((_,i)=>i!==idx)})}>×</button>
+                </div>)}
+              </div>
               <Range label="Speed" min={0.25} max={4} step={0.05} value={selected.speed} suffix={selected.speed.toFixed(2)+'×'} onChange={value => updateSelected({speed:value})}/>
             </section>}
           </>}
@@ -734,17 +1044,18 @@ function App() {
               <button onClick={undo} title="Undo"><Undo2 size={17}/></button>
               <button onClick={redo} title="Redo"><Redo2 size={17}/></button>
               <span className="divider"/>
-              <button className="tool-with-label" onClick={splitSelected}><Scissors size={17}/> Split <kbd>Ctrl+B</kbd></button>
+              <button className="tool-with-label" onClick={splitSelected} title="Select a clip, position the playhead inside it, then split. Shortcut: Ctrl/Cmd+B"><Scissors size={17}/> Split <kbd>Ctrl+B</kbd></button>
               <button className="tool-with-label" onClick={deleteSelected}><Trash2 size={17}/> Delete</button>
               <button className="tool-with-label" onClick={duplicateSelected}><Copy size={17}/> Duplicate</button>
               <button className={`tool-with-label ${snap ? 'is-on' : ''}`} onClick={() => setSnap(v => !v)}>Snap</button>
             </div>
             <div className="zoom-tools">
-              <ZoomOut size={16}/><input type="range" min=".5" max="3" step=".1" value={zoom} onChange={e => setZoom(+e.target.value)}/><ZoomIn size={16}/>
+              <button type="button" aria-label="Zoom out timeline" onClick={() => setTimelineZoom(zoom / 1.5)}><ZoomOut size={16}/></button><input aria-label="Timeline zoom" type="range" min="0" max="100" step="1" value={Math.round(100 * Math.log(zoom / 0.001) / Math.log(64000))} onChange={e => setTimelineZoom(0.001 * Math.pow(64000, +e.target.value / 100))}/><button type="button" aria-label="Zoom in timeline" onClick={() => setTimelineZoom(zoom * 1.5)}><ZoomIn size={16}/></button><button type="button" className="fit-timeline" onClick={fitTimeline}>Fit</button><small title="Ctrl/Cmd + wheel to zoom, Shift + wheel to pan"> {pxPerSecond.toFixed(1)}px/s</small>
             </div>
           </div>
-          <div className="timeline-scroll" ref={timelineRef}>
-            <div className="timeline-inner" style={{ width: 190 + project.duration * pxPerSecond + 120 }}>
+          {editNotice && <div className="timeline-edit-notice" role="status">{editNotice}<button type="button" aria-label="Dismiss editing message" onClick={() => setEditNotice('')}>×</button></div>}
+          <div className={`timeline-scroll ${isTimelineDropTarget ? 'is-drop-target' : ''}`} ref={timelineRef} onWheel={onTimelineWheel} onDragOver={event => acceptAssetDrag(event)} onDrop={event => dropAsset(event)} onDragLeave={() => { setIsTimelineDropTarget(false); setDropTargetTrackId(null) }}>
+            <div className="timeline-inner" style={{ width: Math.max(timelineRef.current?.clientWidth ?? 0, 190 + project.duration * pxPerSecond + 120) }}>
               <div className="ruler-row timeline-scrub-zone"
                 onPointerDown={beginTimelineScrub}
                 onPointerMove={moveTimelineScrub}
@@ -757,20 +1068,32 @@ function App() {
               </div>
               {project.tracks.map(track => (
                 <div className="track-row" key={track.id}>
-                  <div className="track-label">
-                    <span className="track-icon">{track.type === 'audio' ? <Music2/> : track.type === 'text' ? <Type/> : track.type === 'image' ? <ImageIcon/> : <Film/>}</span>
-                    <strong>{track.name}</strong>
-                    <div className="track-actions">
-                      <button onClick={() => toggleTrack(track.id,'visible')}>{track.visible ? <Eye/> : <EyeOff/>}</button>
-                      <button onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button>
+                  <div className={`track-label ${track.type === 'audio' || track.type === 'video' ? 'has-audio' : ''} ${selectedTrackId === track.id ? 'track-selected' : ''}`}>
+                    <div className="track-label-main">
+                      <span className="track-icon">{track.type === 'audio' ? <Music2/> : track.type === 'text' ? <Type/> : track.type === 'image' ? <ImageIcon/> : <Film/>}</span>
+                      <strong title={track.name} onClick={() => {setSelectedTrackId(track.id);setSelectedClipId(null)}}>{track.name}</strong>
+                      <div className="track-actions">
+                        <button title="Move layer up (in front)" aria-label={'Move '+track.name+' above'} disabled={project.tracks[0].id === track.id} onClick={() => moveTrack(track.id,-1)}><ArrowUp/></button>
+                        <button title="Move layer down (behind)" aria-label={'Move '+track.name+' below'} disabled={project.tracks[project.tracks.length-1].id === track.id} onClick={() => moveTrack(track.id,1)}><ArrowDown/></button>
+                        <button title={track.visible ? 'Hide track' : 'Show track'} aria-label={(track.visible?'Hide ':'Show ')+track.name} onClick={() => toggleTrack(track.id,'visible')}>{track.visible ? <Eye/> : <EyeOff/>}</button>
+                        <button aria-label={track.locked ? 'Unlock ' + track.name : 'Lock ' + track.name} onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button>
+                        <button aria-label={'Delete track ' + track.name} title="Delete track and its clips" disabled={track.locked} onClick={() => removeTrack(track.id)}><Trash2/></button>
+                      </div>
                     </div>
+                    {(track.type === 'audio' || track.type === 'video') && <div className="track-volume-bar">
+                      <button type="button" title={track.muted ? 'Unmute track audio' : 'Mute track audio without hiding video'} aria-label={(track.muted?'Unmute ':'Mute ')+track.name} disabled={track.locked} onClick={() => updateTrackAudio(track.id,{muted:!track.muted})}>{track.muted || (track.volume??1)===0 ? <VolumeX/> : <Volume2/>}</button>
+                      <input type="range" aria-label={'Audio level for '+track.name} min={0} max={1} step={0.01} value={track.volume??1} disabled={track.locked} onPointerDown={e=>e.stopPropagation()} onChange={e=>updateTrackAudio(track.id,{volume:Number(e.target.value)})}/>
+                      <small>{Math.round((track.volume??1)*100)}%</small>
+                    </div>}
                   </div>
                   <div className="track-lane timeline-scrub-zone"
                     style={{ width: project.duration * pxPerSecond }}
                     onPointerDown={beginTimelineScrub}
                     onPointerMove={moveTimelineScrub}
                     onPointerUp={endTimelineScrub}
-                    onPointerCancel={endTimelineScrub}>
+                    onPointerCancel={endTimelineScrub}
+                    onDragOver={event => acceptAssetDrag(event, track.id)}
+                    onDrop={event => dropAsset(event, track.id)}>
                     {track.clips.map(clip => (
                       <div key={clip.id}
                         className={`timeline-clip ${TRACK_COLORS[clip.type]} ${selectedClipId===clip.id?'selected':''} ${track.locked?'locked':''}`}
@@ -778,19 +1101,20 @@ function App() {
                         onPointerDown={e => beginClipDrag(e, clip, 'move')}
                         onPointerMove={moveClipDrag}
                         onPointerUp={endClipDrag}
-                        onDoubleClick={() => { setPlayhead(clip.start); setSelectedClipId(clip.id) }}>
+                        onDoubleClick={() => { setPlaying(false); setPlayhead(clip.start + clip.duration / 2); setSelectedClipId(clip.id); setEditNotice('') }}>
                         <div className="trim-handle left" onPointerDown={e => beginClipDrag(e,clip,'trim-left')}/>
                         <div className="clip-content">
                           {clip.type === 'audio' ? <Wave/> : clip.type === 'text' ? <Type size={14}/> : clip.type === 'image' ? <ImageIcon size={14}/> : <Film size={14}/>}
                           <span>{clip.text || clip.name}</span>
                         </div>
+                        {(clip.type === 'audio' || clip.type === 'video') && !!clip.volumeKeyframes?.length && <div className="clip-gain-points" aria-label="Volume automation points">{clip.volumeKeyframes.map((point,idx)=><span key={idx} title={point.time.toFixed(2)+'s · '+Math.round(point.gain*100)+'%'} style={{left:(Math.max(0,Math.min(clip.duration,point.time))/clip.duration)*100+'%',bottom:(6+point.gain*15)+'px'}}/>)}</div>}
                         <div className="trim-handle right" onPointerDown={e => beginClipDrag(e,clip,'trim-right')}/>
                       </div>
                     ))}
                   </div>
                 </div>
               ))}
-              <div className="add-track-row"><button onClick={addTrack}><Plus size={16}/> Add Track</button></div>
+              <div className={`add-track-row ${isTimelineDropTarget && !dropTargetTrackId ? 'drop-ready' : ''}`} onDragOver={event => acceptAssetDrag(event)} onDrop={event => dropAsset(event)}><button onClick={addTrack}><Plus size={16}/> Add empty track</button><small>Drop media here to create a new track</small></div>
               <div className="playhead" style={{ left: 190 + playhead * pxPerSecond }}>
                 <div className="playhead-head"/><div className="playhead-line"/>
               </div>
@@ -818,7 +1142,12 @@ function App() {
         </div>
       </div>}
     </div>
+    </div>
   )
+}
+
+function App() {
+  return <CJCutEditor />
 }
 
 function Range({label,min,max,step,value,suffix,onChange}:{label:string,min:number,max:number,step:number,value:number,suffix:string,onChange:(v:number)=>void}) {
