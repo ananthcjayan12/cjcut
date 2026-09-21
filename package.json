@@ -34,6 +34,10 @@
     "./timeline": {
       "types": "./dist-plugin/timeline-operations.d.ts",
       "import": "./dist-plugin/timeline-operations.js"
+    },
+    "./audio": {
+      "types": "./dist-plugin/audio-automation.d.ts",
+      "import": "./dist-plugin/audio-automation.js"
     }
   }
 }
