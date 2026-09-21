@@ -1019,7 +1019,20 @@ export function CJCutEditor({
             </section>}
             {(selected.type === 'video' || selected.type === 'audio') && <section className="property-section">
               <h4><ChevronDown size={15}/> Audio</h4>
-              <Range label="Volume" min={0} max={1} step={0.01} value={selected.volume} suffix={Math.round(selected.volume*100)+'%'} onChange={value => updateSelected({volume:value})}/>
+              <Range label="Clip volume" min={0} max={1} step={0.01} value={selected.volume} suffix={Math.round(selected.volume*100)+'%'} onChange={value => updateSelected({volume:value})}/>
+              {selectedTrack && <p className="audio-track-gain">Track gain: {Math.round((selectedTrack.volume ?? 1)*100)}% {selectedTrack.muted ? '· MUTED' : ''} · Effective: {Math.round(effectiveVolume(selected, playhead-selected.start)*100)}%</p>}
+              <Range label="Fade in" min={0} max={selected.duration} step={0.05} value={Math.min(selected.duration,selected.fadeIn ?? 0)} suffix={(selected.fadeIn ?? 0).toFixed(2)+'s'} onChange={value => updateSelected({fadeIn:value})}/>
+              <Range label="Fade out" min={0} max={selected.duration} step={0.05} value={Math.min(selected.duration,selected.fadeOut ?? 0)} suffix={(selected.fadeOut ?? 0).toFixed(2)+'s'} onChange={value => updateSelected({fadeOut:value})}/>
+              <div className="audio-automation">
+                <div className="audio-automation-head"><strong>Progressive volume</strong><button onClick={() => addVolumePoint(selected, Math.max(0, Math.min(selected.duration, playhead-selected.start)), effectiveVolume(selected, playhead-selected.start)/(unit(selected.volume)*unit(selectedTrack?.volume ?? 1) || 1))} disabled={playhead < selected.start || playhead > selected.start + selected.duration}>+ Keyframe at playhead</button></div>
+                <small>Volume points are relative to this clip. Move the playhead into the clip to add one; drag the slider to create a rise or drop in sound.</small>
+                {(selected.volumeKeyframes ?? []).map((point, idx) => <div className="audio-keyframe-row" key={idx}>
+                  <label>At <input type="number" min={0} max={selected.duration} step={0.05} value={+point.time.toFixed(2)} onChange={e => updateSelected({volumeKeyframes:(selected.volumeKeyframes ?? []).map((p,i) => i===idx ? {...p,time:Math.max(0,Math.min(selected.duration,Number(e.target.value)||0))} : p).sort((a,b)=>a.time-b.time)})}/> s</label>
+                  <input type="range" aria-label={'Volume at '+point.time.toFixed(2)+' seconds'} min={0} max={1} step={0.01} value={point.gain} onChange={e => updateSelected({volumeKeyframes:(selected.volumeKeyframes ?? []).map((p,i) => i===idx ? {...p,gain:Number(e.target.value)} : p)})}/>
+                  <span>{Math.round(point.gain*100)}%</span>
+                  <button title="Delete volume keyframe" aria-label={'Delete keyframe at '+point.time.toFixed(2)+' seconds'} onClick={() => updateSelected({volumeKeyframes:(selected.volumeKeyframes ?? []).filter((_,i)=>i!==idx)})}>×</button>
+                </div>)}
+              </div>
               <Range label="Speed" min={0.25} max={4} step={0.05} value={selected.speed} suffix={selected.speed.toFixed(2)+'×'} onChange={value => updateSelected({speed:value})}/>
             </section>}
           </>}
@@ -1055,13 +1068,23 @@ export function CJCutEditor({
               </div>
               {project.tracks.map(track => (
                 <div className="track-row" key={track.id}>
-                  <div className="track-label">
-                    <span className="track-icon">{track.type === 'audio' ? <Music2/> : track.type === 'text' ? <Type/> : track.type === 'image' ? <ImageIcon/> : <Film/>}</span>
-                    <strong>{track.name}</strong>
-                    <div className="track-actions">
-                      <button onClick={() => toggleTrack(track.id,'visible')}>{track.visible ? <Eye/> : <EyeOff/>}</button>
-                      <button aria-label={track.locked ? 'Unlock ' + track.name : 'Lock ' + track.name} onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button><button aria-label={'Delete track ' + track.name} title="Delete track and its clips" disabled={track.locked} onClick={() => removeTrack(track.id)}><Trash2/></button>
+                  <div className={`track-label ${track.type === 'audio' || track.type === 'video' ? 'has-audio' : ''} ${selectedTrackId === track.id ? 'track-selected' : ''}`}>
+                    <div className="track-label-main">
+                      <span className="track-icon">{track.type === 'audio' ? <Music2/> : track.type === 'text' ? <Type/> : track.type === 'image' ? <ImageIcon/> : <Film/>}</span>
+                      <strong title={track.name} onClick={() => {setSelectedTrackId(track.id);setSelectedClipId(null)}}>{track.name}</strong>
+                      <div className="track-actions">
+                        <button title="Move layer up (in front)" aria-label={'Move '+track.name+' above'} disabled={project.tracks[0].id === track.id} onClick={() => moveTrack(track.id,-1)}><ArrowUp/></button>
+                        <button title="Move layer down (behind)" aria-label={'Move '+track.name+' below'} disabled={project.tracks[project.tracks.length-1].id === track.id} onClick={() => moveTrack(track.id,1)}><ArrowDown/></button>
+                        <button title={track.visible ? 'Hide track' : 'Show track'} aria-label={(track.visible?'Hide ':'Show ')+track.name} onClick={() => toggleTrack(track.id,'visible')}>{track.visible ? <Eye/> : <EyeOff/>}</button>
+                        <button aria-label={track.locked ? 'Unlock ' + track.name : 'Lock ' + track.name} onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button>
+                        <button aria-label={'Delete track ' + track.name} title="Delete track and its clips" disabled={track.locked} onClick={() => removeTrack(track.id)}><Trash2/></button>
+                      </div>
                     </div>
+                    {(track.type === 'audio' || track.type === 'video') && <div className="track-volume-bar">
+                      <button type="button" title={track.muted ? 'Unmute track audio' : 'Mute track audio without hiding video'} aria-label={(track.muted?'Unmute ':'Mute ')+track.name} disabled={track.locked} onClick={() => updateTrackAudio(track.id,{muted:!track.muted})}>{track.muted || (track.volume??1)===0 ? <VolumeX/> : <Volume2/>}</button>
+                      <input type="range" aria-label={'Audio level for '+track.name} min={0} max={1} step={0.01} value={track.volume??1} disabled={track.locked} onPointerDown={e=>e.stopPropagation()} onChange={e=>updateTrackAudio(track.id,{volume:Number(e.target.value)})}/>
+                      <small>{Math.round((track.volume??1)*100)}%</small>
+                    </div>}
                   </div>
                   <div className="track-lane timeline-scrub-zone"
                     style={{ width: project.duration * pxPerSecond }}
@@ -1084,6 +1107,7 @@ export function CJCutEditor({
                           {clip.type === 'audio' ? <Wave/> : clip.type === 'text' ? <Type size={14}/> : clip.type === 'image' ? <ImageIcon size={14}/> : <Film size={14}/>}
                           <span>{clip.text || clip.name}</span>
                         </div>
+                        {(clip.type === 'audio' || clip.type === 'video') && !!clip.volumeKeyframes?.length && <div className="clip-gain-points" aria-label="Volume automation points">{clip.volumeKeyframes.map((point,idx)=><span key={idx} title={point.time.toFixed(2)+'s · '+Math.round(point.gain*100)+'%'} style={{left:(Math.max(0,Math.min(clip.duration,point.time))/clip.duration)*100+'%',bottom:(6+point.gain*15)+'px'}}/>)}</div>
                         <div className="trim-handle right" onPointerDown={e => beginClipDrag(e,clip,'trim-right')}/>
                       </div>
                     ))}
