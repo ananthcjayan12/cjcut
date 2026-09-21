@@ -185,17 +185,24 @@ export function CJCutEditor({
   const zoomInitializedRef = useRef(false)
   const previewRefs = useRef<Record<string, HTMLVideoElement | HTMLAudioElement | null>>({})
   const loadedProjectKeyRef = useRef(projectKey)
+  const externalProjectRef = useRef(initialProject)
   const onProjectChangeRef = useRef(onProjectChange)
   const onSaveRef = useRef(onSave)
 
   useEffect(() => { onProjectChangeRef.current = onProjectChange }, [onProjectChange])
   useEffect(() => { onSaveRef.current = onSave }, [onSave])
   useEffect(() => {
-    if (!initialProject || loadedProjectKeyRef.current === projectKey) return
+    if (!initialProject) return
+    if (loadedProjectKeyRef.current === projectKey && externalProjectRef.current === initialProject) return
+    // The host sends a new projectKey BEFORE its async asset reconciliation
+    // finishes. Wait for the corresponding new project object; otherwise the
+    // stale first render wins and fresh B-roll never appears.
+    if (loadedProjectKeyRef.current !== projectKey && externalProjectRef.current === initialProject) return
+    externalProjectRef.current = initialProject
     loadedProjectKeyRef.current = projectKey
     setProject(clone(initialProject))
     setSelectedClipId(null)
-    setPlayhead(0)
+    setPlayhead(time => Math.min(time, initialProject.duration))
     setEditNotice('')
     setPlaying(false)
     setPast([])
