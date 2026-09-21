@@ -10,5 +10,8 @@ export type {
   MediaAsset as CJCutMediaAsset,
 } from './App'
 
+export { volumeEnvelopeAt, splitAudioAutomation, ffmpegKeyframeExpression } from './audio-automation'
+export type { AudioKeyframe, AudioAutomation } from './audio-automation'
+
 export { splitTimelineClip } from './timeline-operations'
 export type { TimelineSplitResult } from './timeline-operations'
