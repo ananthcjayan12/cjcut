@@ -568,50 +568,81 @@ export function CJCutEditor({
     }
   }, [playing, project.duration])
 
-  // Keep media playback continuous. Re-seeking a <video>/<audio> element on every
-  // animation frame forces the browser decoder to flush repeatedly and causes
-  // visible frame stalls and distorted/choppy audio.
+  // The preview clock belongs to the timeline, not to an individual audio
+  // element. Starting/importing a new audio clip must never re-seek or pause a
+  // video that was already playing. Only newly active media is synchronized.
+  const initializedMedia = useRef(new WeakMap<HTMLMediaElement, string>())
+  playheadNow.current = playhead
+
+  const updateElementGain = (clip: Clip, element: HTMLMediaElement, at: number) => {
+    const gain = effectiveVolume(clip, at - clip.start)
+    element.volume = gain
+    element.muted = gain <= 0.000001
+    element.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
+  }
+
+  const startMedia = (clip: Clip) => {
+    const el = previewRefs.current[clip.id]
+    if (!el || !playing) return
+    const source = el.currentSrc || el.src
+    if (initializedMedia.current.get(el) !== source || !activePlaybackIds.current.has(clip.id)) {
+      const target = clip.sourceStart + (playheadNow.current - clip.start) * clip.speed
+      try { el.currentTime = Math.max(0, target) } catch { /* wait for metadata */ }
+      initializedMedia.current.set(el, source)
+    }
+    updateElementGain(clip, el, playheadNow.current)
+    if (el.paused) void el.play().catch(error => {
+      // NotAllowedError means the browser needs a user gesture; the transport
+      // button already supplies one on desktop. Do not pause other media.
+      if (error?.name !== 'AbortError') setEditNotice('Could not start ' + clip.name + ': ' + (error?.message || 'browser playback blocked'))
+    })
+  }
+
   useEffect(() => {
-    if (!playing) return
-
-    const activeIds = new Set(activeMediaKey ? activeMediaKey.split('|') : [])
-    Object.entries(previewRefs.current).forEach(([id, element]) => {
-      if (element && !activeIds.has(id)) element.pause()
-    })
-
+    if (!playing) {
+      Object.values(previewRefs.current).forEach(el => el?.pause())
+      activePlaybackIds.current.clear()
+      return
+    }
+    const active = new Set(activeMediaKey ? activeMediaKey.split('|') : [])
+    for (const id of activePlaybackIds.current) {
+      if (!active.has(id)) previewRefs.current[id]?.pause()
+    }
     visibleClips.forEach(({ clip }) => {
-      if (!clip.url || (clip.type !== 'video' && clip.type !== 'audio')) return
-      const el = previewRefs.current[clip.id]
-      if (!el) return
-
-      const target = clip.sourceStart + (playhead - clip.start) * clip.speed
-      try { el.currentTime = Math.max(0, target) } catch { /* metadata may still be loading */ }
-      el.volume = Math.max(0, Math.min(1, clip.volume))
-      el.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
-      el.play().catch(() => undefined)
+      if (active.has(clip.id)) startMedia(clip)
     })
-    // Sync once when playback starts or the active clip set changes. From there,
-    // the browser media clock is allowed to run without repeated seeks.
+    activePlaybackIds.current = active
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing, activeMediaKey])
 
-  // While paused/scrubbing we do want frame-accurate seeking so the preview
-  // follows the playhead immediately.
+  // Gain automation is lightweight: update volume each preview frame, but let
+  // the browser video/audio clocks run without decoder-flushing seeks.
+  useEffect(() => {
+    if (!playing) return
+    visibleClips.forEach(({ clip }) => {
+      if (clip.type !== 'audio' && clip.type !== 'video') return
+      const el = previewRefs.current[clip.id]
+      if (el) updateElementGain(clip, el, playhead)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playhead, project, playing])
+
+  // Paused scrubbing is the only point at which all visible media is sought.
   useEffect(() => {
     if (playing) return
     visibleClips.forEach(({ clip }) => {
-      if (!clip.url || (clip.type !== 'video' && clip.type !== 'audio')) return
+      if (clip.type !== 'audio' && clip.type !== 'video') return
       const el = previewRefs.current[clip.id]
       if (!el) return
       const target = clip.sourceStart + (playhead - clip.start) * clip.speed
-      if (Math.abs(el.currentTime - target) > 0.015) {
+      if (Math.abs(el.currentTime - target) > 0.025) {
         try { el.currentTime = Math.max(0, target) } catch { /* metadata may still be loading */ }
       }
-      el.volume = Math.max(0, Math.min(1, clip.volume))
-      el.playbackRate = Math.max(0.25, Math.min(4, clip.speed))
+      updateElementGain(clip, el, playhead)
       el.pause()
     })
-  }, [playhead, playing, activeMediaKey, visibleClips])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playhead, playing, activeMediaKey, project])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -951,13 +982,13 @@ export function CJCutEditor({
                   <div key={clip.id} className={`preview-layer ${clip.type === 'video' || clip.type === 'image' ? 'media-layer' : ''} ${selectedClipId === clip.id ? 'selected' : ''}`}
                     style={{ left: clip.x + '%', top: clip.y + '%', opacity: clip.opacity, transform: `translate(-50%,-50%) scale(${clip.scale}) rotate(${clip.rotation}deg)` }}
                     onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id) }}>
-                    {clip.type === 'video' && clip.url && <video ref={el => { previewRefs.current[clip.id] = el }} src={clip.url} muted={clip.volume === 0} playsInline />}
+                    {clip.type === 'video' && clip.url && <video ref={bindMediaRef(clip.id)} src={clip.url} playsInline preload="auto" onCanPlay={() => startMedia(clip)} />}
                     {clip.type === 'image' && clip.url && <img src={clip.url}/>}
                     {clip.type === 'text' && <div className="preview-text">{clip.text}</div>}
                   </div>
                 ))}
               {visibleClips.filter(({clip}) => clip.type === 'audio' && clip.url).map(({clip}) =>
-                <audio key={clip.id} ref={el => { previewRefs.current[clip.id] = el }} src={clip.url}/>
+                <audio key={clip.id} ref={bindMediaRef(clip.id)} src={clip.url} preload="auto" onCanPlay={() => startMedia(clip)}/>
               )}
             </div>
           </div>
