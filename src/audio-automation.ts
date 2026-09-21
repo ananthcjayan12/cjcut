@@ -37,30 +37,29 @@ export function volumeEnvelopeAt(clip: AudioAutomation, localTime: number, durat
 export function splitAudioAutomation<T extends AudioAutomation & { duration: number }>(clip: T, splitAt: number): [T, T] {
   const leftDuration = splitAt;
   const rightDuration = clip.duration - splitAt;
-  const points = (clip.volumeKeyframes ?? []).filter(p => p.time >= 0 && p.time <= clip.duration)
-    .sort((a, b) => a.time - b.time);
-  const rawGainAt = (time: number) => volumeEnvelopeAt({ volumeKeyframes: points }, time, clip.duration);
-  const splitGain = rawGainAt(splitAt);
-  const leftPoints = points.filter(p => p.time < splitAt).map(p => ({ ...p }));
-  const rightPoints = points.filter(p => p.time > splitAt).map(p => ({ time: p.time - splitAt, gain: p.gain }));
-  if (points.length) {
-    leftPoints.push({ time: splitAt, gain: splitGain });
-    rightPoints.unshift({ time: 0, gain: splitGain });
+  if (!clip.fadeIn && !clip.fadeOut && !(clip.volumeKeyframes ?? []).length) {
+    return [{ ...clip, duration: leftDuration }, { ...clip, duration: rightDuration }];
   }
-  const originalFadeIn = Math.max(0, clip.fadeIn ?? 0);
-  const originalFadeOut = Math.max(0, clip.fadeOut ?? 0);
-  const fadeOutStart = clip.duration - originalFadeOut;
+  // Materialize the original envelope before splitting. A new cut must not
+  // introduce a new fade-to-zero at either cut edge or restart the old fade.
+  const cuts = [0, splitAt, clip.duration, Math.min(clip.duration, Math.max(0, clip.fadeIn ?? 0)),
+    Math.max(0, clip.duration - (clip.fadeOut ?? 0)), ...(clip.volumeKeyframes ?? []).map(point => point.time)];
+  const ordered = [...new Set(cuts.filter(t => Number.isFinite(t) && t >= 0 && t <= clip.duration))]
+    .sort((a, b) => a - b);
+  const times: number[] = [];
+  for (let i = 0; i < ordered.length; i += 1) {
+    times.push(ordered[i]);
+    if (i + 1 < ordered.length && (clip.fadeIn || clip.fadeOut) && ordered[i + 1] - ordered[i] > 0.12) {
+      times.push((ordered[i] + ordered[i + 1]) / 2);
+    }
+  }
+  const leftPoints = times.filter(t => t <= splitAt)
+    .map(time => ({ time, gain: volumeEnvelopeAt(clip, time, clip.duration) }));
+  const rightPoints = times.filter(t => t >= splitAt)
+    .map(time => ({ time: time - splitAt, gain: volumeEnvelopeAt(clip, time, clip.duration) }));
   return [
-    { ...clip, duration: leftDuration,
-      fadeIn: Math.min(originalFadeIn, leftDuration),
-      fadeOut: Math.min(leftDuration, Math.max(0, splitAt - Math.max(0, fadeOutStart))),
-      volumeKeyframes: leftPoints,
-    },
-    { ...clip, duration: rightDuration,
-      fadeIn: Math.min(rightDuration, Math.max(0, originalFadeIn - splitAt)),
-      fadeOut: Math.min(rightDuration, originalFadeOut),
-      volumeKeyframes: rightPoints,
-    },
+    { ...clip, duration: leftDuration, fadeIn: 0, fadeOut: 0, volumeKeyframes: leftPoints },
+    { ...clip, duration: rightDuration, fadeIn: 0, fadeOut: 0, volumeKeyframes: rightPoints },
   ];
 }
 
