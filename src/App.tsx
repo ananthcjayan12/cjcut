@@ -77,6 +77,7 @@ export type CJCutEditorProps = {
   brandName?: string
   allowMediaImport?: boolean
   hostMedia?: MediaAsset[]
+  onImportFiles?: (files: File[]) => Promise<void> | void
   onProjectChange?: (project: Project) => void
   onSave?: (project: Project) => void
 }
@@ -155,6 +156,7 @@ export function CJCutEditor({
   brandName = 'CJCut',
   allowMediaImport = true,
   hostMedia = [],
+  onImportFiles,
   onProjectChange,
   onSave,
 }: CJCutEditorProps = {}) {
@@ -635,6 +637,16 @@ export function CJCutEditor({
 
   const importMedia = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = [...(event.target.files ?? [])]
+    event.target.value = ''
+    if (onImportFiles) {
+      try {
+        await onImportFiles(files)
+        setEditNotice('Media imported to project library. Drag it onto the timeline to create a track.')
+      } catch (error) {
+        setEditNotice(error instanceof Error ? error.message : 'Could not import media.')
+      }
+      return
+    }
     const assets: MediaAsset[] = []
     for (const file of files) {
       const kind: MediaKind | null = file.type.startsWith('video/') ? 'video'
@@ -831,7 +843,7 @@ export function CJCutEditor({
           <div className="asset-panel">
             {leftTab === 'media' && <>
               <div className="panel-tabs"><button className="active">Import</button><button>Record</button><button>Stock</button></div>
-              {allowMediaImport ? <>
+              {(allowMediaImport || onImportFiles) ? <>
                 <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
                   <Upload size={25}/><strong>Import Media</strong><span>Videos, images or audio</span>
                 </button>
@@ -860,7 +872,7 @@ export function CJCutEditor({
             </div>}
             {leftTab === 'audio' && <div className="simple-panel">
               <h3>Audio</h3><p>Import music or narration, then click it to add it to the timeline.</p>
-              {allowMediaImport && <button className="primary-wide" onClick={() => fileInputRef.current?.click()}><Upload size={17}/> Import audio</button>}
+              {(allowMediaImport || onImportFiles) && <button className="primary-wide" onClick={() => { setLeftTab('media'); fileInputRef.current?.click() }}><Upload size={17}/> Import audio</button>}
             </div>}
           </div>
         </aside>
