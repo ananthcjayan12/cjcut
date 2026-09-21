@@ -4,7 +4,7 @@ import {
   Scissors, Settings2, SkipBack, SkipForward, Sparkles, Trash2, Type, Undo2,
   Unlock, Upload, Volume2, ZoomIn, ZoomOut
 } from 'lucide-react'
-import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { splitTimelineClip } from './timeline-operations'
 
 export type TrackType = 'video' | 'image' | 'audio' | 'text'
@@ -18,6 +18,11 @@ export type MediaAsset = {
   duration: number
   width?: number
   height?: number
+  externalId?: string
+  role?: Clip['role']
+  metadata?: Clip['metadata']
+  sourceStart?: number
+  sourceDuration?: number
 }
 
 export type Clip = {
@@ -62,6 +67,7 @@ export type Project = {
   fps: number
   duration: number
   tracks: Track[]
+  suppressedManagedTrackIds?: string[]
 }
 
 export type CJCutEditorProps = {
@@ -70,6 +76,7 @@ export type CJCutEditorProps = {
   embedded?: boolean
   brandName?: string
   allowMediaImport?: boolean
+  hostMedia?: MediaAsset[]
   onProjectChange?: (project: Project) => void
   onSave?: (project: Project) => void
 }
@@ -147,6 +154,7 @@ export function CJCutEditor({
   embedded = false,
   brandName = 'CJCut',
   allowMediaImport = true,
+  hostMedia = [],
   onProjectChange,
   onSave,
 }: CJCutEditorProps = {}) {
@@ -157,6 +165,9 @@ export function CJCutEditor({
   const [editNotice, setEditNotice] = useState('')
   const [playing, setPlaying] = useState(false)
   const [zoom, setZoom] = useState(1)
+  const [draggingAssetId, setDraggingAssetId] = useState<string | null>(null)
+  const [isTimelineDropTarget, setIsTimelineDropTarget] = useState(false)
+  const [dropTargetTrackId, setDropTargetTrackId] = useState<string | null>(null)
   const [snap, setSnap] = useState(true)
   const [leftTab, setLeftTab] = useState<'media' | 'text' | 'audio'>('media')
   const [past, setPast] = useState<Project[]>([])
@@ -170,6 +181,8 @@ export function CJCutEditor({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const projectInputRef = useRef<HTMLInputElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
+  const pendingZoomAnchor = useRef<{ time: number; viewportX: number } | null>(null)
+  const zoomInitializedRef = useRef(false)
   const previewRefs = useRef<Record<string, HTMLVideoElement | HTMLAudioElement | null>>({})
   const loadedProjectKeyRef = useRef(projectKey)
   const onProjectChangeRef = useRef(onProjectChange)
@@ -194,6 +207,62 @@ export function CJCutEditor({
 
 
   const pxPerSecond = 44 * zoom
+  const assetLibrary = useMemo(() => {
+    const existing = new Set<string>()
+    return [...hostMedia, ...media].filter(asset => {
+      if (existing.has(asset.id)) return false
+      existing.add(asset.id)
+      return true
+    })
+  }, [hostMedia, media])
+
+  const setTimelineZoom = (requested: number, cursorX?: number) => {
+    const timeline = timelineRef.current
+    const next = Math.max(0.001, Math.min(64, requested))
+    if (timeline && Math.abs(next - zoom) > 0.000001) {
+      const rect = timeline.getBoundingClientRect()
+      const viewportX = Math.max(190, Math.min(timeline.clientWidth, cursorX === undefined ? timeline.clientWidth / 2 : cursorX - rect.left))
+      const time = Math.max(0, (timeline.scrollLeft + viewportX - 190) / pxPerSecond)
+      pendingZoomAnchor.current = { time, viewportX }
+    }
+    setZoom(next)
+  }
+
+  useLayoutEffect(() => {
+    const anchor = pendingZoomAnchor.current
+    const timeline = timelineRef.current
+    if (!anchor || !timeline) return
+    timeline.scrollLeft = Math.max(0, 190 + anchor.time * pxPerSecond - anchor.viewportX)
+    pendingZoomAnchor.current = null
+  }, [zoom, pxPerSecond])
+
+  const fitTimeline = () => {
+    const viewport = timelineRef.current?.clientWidth ?? 1000
+    const usable = Math.max(140, viewport - 214)
+    setTimelineZoom(Math.max(0.001, Math.min(64, usable / Math.max(1, project.duration) / 44)))
+    if (timelineRef.current) timelineRef.current.scrollLeft = 0
+  }
+
+  useEffect(() => {
+    if (zoomInitializedRef.current) return
+    const timeline = timelineRef.current
+    if (!timeline) return
+    zoomInitializedRef.current = true
+    const usable = Math.max(140, timeline.clientWidth - 214)
+    setZoom(Math.max(0.001, Math.min(64, usable / Math.max(1, project.duration) / 44)))
+  }, [project.duration])
+
+  const onTimelineWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      event.preventDefault()
+      setTimelineZoom(zoom * Math.exp(-event.deltaY * 0.004), event.clientX)
+    } else if (event.shiftKey && timelineRef.current) {
+      event.preventDefault()
+      timelineRef.current.scrollLeft += event.deltaY + event.deltaX
+    }
+    // Unmodified wheel scrolls vertically; horizontal trackpad scrolls natively.
+  }
+
   const selected = useMemo(() => {
     for (const track of project.tracks) {
       const found = track.clips.find(c => c.id === selectedClipId)
@@ -573,7 +642,7 @@ export function CJCutEditor({
     event.target.value = ''
   }
 
-  const addAsset = (asset: MediaAsset) => {
+  const addAsset = (asset: MediaAsset, start = playhead, trackId?: string) => {
     commit(p => {
       const hasPrimaryVideo = p.tracks.some(t => t.type === 'video' && t.clips.length > 0)
       if (asset.kind === 'video' && !hasPrimaryVideo && asset.width && asset.height) {
@@ -581,17 +650,19 @@ export function CJCutEditor({
         p.height = asset.height
       }
 
-      let track = p.tracks.find(t => t.type === asset.kind && !t.locked)
-      if (!track && asset.kind === 'image') track = p.tracks.find(t => t.id === 'overlay')
+      // A new media drop is a new layer by default. Dropping directly onto a
+      // compatible unlocked track can intentionally reuse that track.
+      let track = trackId ? p.tracks.find(t => t.id === trackId && t.type === asset.kind && !t.locked) : undefined
       if (!track) {
-        track = { id: uid(), name: asset.kind + ' ' + (p.tracks.length + 1), type: asset.kind, visible: true, locked: false, clips: [] }
+        track = { id: uid(), name: asset.name, type: asset.kind, visible: true, locked: false, clips: [] }
         p.tracks.unshift(track)
       }
       const clip: Clip = {
         id: uid(), trackId: track.id, type: asset.kind, name: asset.name, mediaId: asset.id, url: asset.url,
-        start: playhead, duration: asset.kind === 'image' ? 5 : asset.duration,
-        sourceStart: 0, sourceDuration: asset.duration,
-        x: 50, y: 50, scale: 1, rotation: 0, opacity: 1, volume: 1, speed: 1,
+        start: Math.max(0, start), duration: asset.kind === 'image' ? Math.min(5, Math.max(0.25, asset.duration)) : asset.duration,
+        sourceStart: asset.sourceStart ?? 0, sourceDuration: asset.sourceDuration ?? asset.duration,
+        externalId: asset.externalId, role: asset.role, metadata: asset.metadata,
+        x: 50, y: 50, scale: 1, rotation: 0, opacity: 1, volume: asset.role === 'broll' ? 0 : 1, speed: 1,
       }
       track.clips.push(clip)
       p.duration = Math.max(p.duration, clip.start + clip.duration + 2)
@@ -632,6 +703,55 @@ export function CJCutEditor({
       p.tracks.unshift({ id: uid(), name: 'Video ' + count, type: 'image', visible: true, locked: false, clips: [] })
       return p
     })
+  }
+
+  const removeTrack = (id: string) => {
+    const track = project.tracks.find(item => item.id === id)
+    if (!track) return
+    if (track.locked) { setEditNotice('Unlock this track before deleting it.'); return }
+    if (track.clips.length && !window.confirm('Delete "' + track.name + '" and all ' + track.clips.length + ' clip(s) on it?')) return
+    commit(p => {
+      const removed = p.tracks.find(item => item.id === id)
+      if (removed?.externalId) p.suppressedManagedTrackIds = [...new Set([...(p.suppressedManagedTrackIds ?? []), removed.externalId])]
+      p.tracks = p.tracks.filter(item => item.id !== id)
+      return p
+    })
+    if (track.clips.some(clip => clip.id === selectedClipId)) setSelectedClipId(null)
+    setEditNotice('Track removed. Undo to restore it.')
+  }
+
+  const beginAssetDrag = (event: ReactDragEvent<HTMLElement>, asset: MediaAsset) => {
+    event.dataTransfer.effectAllowed = 'copy'
+    event.dataTransfer.setData('application/x-cjcut-asset', asset.id)
+    event.dataTransfer.setData('text/plain', asset.name)
+    setDraggingAssetId(asset.id)
+  }
+
+  const acceptAssetDrag = (event: ReactDragEvent<HTMLElement>, trackId: string | null = null) => {
+    if (!event.dataTransfer.types.includes('application/x-cjcut-asset') && !draggingAssetId) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+    setIsTimelineDropTarget(true)
+    setDropTargetTrackId(trackId)
+  }
+
+  const dropAsset = (event: ReactDragEvent<HTMLElement>, trackId: string | null = null) => {
+    const assetId = event.dataTransfer.getData('application/x-cjcut-asset') || draggingAssetId
+    if (!assetId) return
+    event.preventDefault()
+    event.stopPropagation()
+    const asset = assetLibrary.find(item => item.id === assetId)
+    setIsTimelineDropTarget(false)
+    setDropTargetTrackId(null)
+    setDraggingAssetId(null)
+    if (!asset) { setEditNotice('Media item is no longer available.'); return }
+    const timeline = timelineRef.current
+    if (!timeline) return
+    const rect = timeline.getBoundingClientRect()
+    const start = Math.max(0, (event.clientX - rect.left + timeline.scrollLeft - 190) / pxPerSecond)
+    const compatibleTrack = trackId && project.tracks.find(track => track.id === trackId && track.type === asset.kind && !track.locked)
+    addAsset(asset, snapTime(start), compatibleTrack?.id)
+    setEditNotice(compatibleTrack ? 'Media added to existing track.' : 'Media added as a new track at the drop position.')
   }
 
   const serializableProject = () => {
@@ -712,9 +832,9 @@ export function CJCutEditor({
               </> : <div className="host-media-note"><strong>Project media is managed by the host app.</strong><span>Move, trim, split, hide or remove the supplied clips directly on the timeline.</span></div>}
               <div className="asset-filter"><button className="active">All</button><button>Video</button><button>Image</button><button>Audio</button></div>
               <div className="asset-grid">
-                {media.length === 0 && <div className="empty-assets">Your imported media will appear here.</div>}
-                {media.map(asset => (
-                  <button key={asset.id} className="asset-card" onClick={() => addAsset(asset)} title="Click to add at playhead">
+                {assetLibrary.length === 0 && <div className="empty-assets">No media yet. Generate B-roll or import a file to build your library.</div>}
+                {assetLibrary.map(asset => (
+                  <button key={asset.id} className="asset-card" draggable onDragStart={event => beginAssetDrag(event, asset)} onDragEnd={() => { setDraggingAssetId(null); setIsTimelineDropTarget(false) }} onClick={() => addAsset(asset)} title="Drag onto timeline to create a track, or click to add at playhead">
                     <div className="asset-thumb">
                       {asset.kind === 'image' ? <img src={asset.url}/> :
                        asset.kind === 'video' ? <video src={asset.url}/> : <Music2 size={28}/>}
@@ -806,12 +926,12 @@ export function CJCutEditor({
               <button className={`tool-with-label ${snap ? 'is-on' : ''}`} onClick={() => setSnap(v => !v)}>Snap</button>
             </div>
             <div className="zoom-tools">
-              <ZoomOut size={16}/><input type="range" min=".5" max="3" step=".1" value={zoom} onChange={e => setZoom(+e.target.value)}/><ZoomIn size={16}/>
+              <button type="button" aria-label="Zoom out timeline" onClick={() => setTimelineZoom(zoom / 1.5)}><ZoomOut size={16}/></button><input aria-label="Timeline zoom" type="range" min="0" max="100" step="1" value={Math.round(100 * Math.log(zoom / 0.001) / Math.log(64000))} onChange={e => setTimelineZoom(0.001 * Math.pow(64000, +e.target.value / 100))}/><button type="button" aria-label="Zoom in timeline" onClick={() => setTimelineZoom(zoom * 1.5)}><ZoomIn size={16}/></button><button type="button" className="fit-timeline" onClick={fitTimeline}>Fit</button><small title="Ctrl/Cmd + wheel to zoom, Shift + wheel to pan"> {pxPerSecond.toFixed(1)}px/s</small>
             </div>
           </div>
           {editNotice && <div className="timeline-edit-notice" role="status">{editNotice}<button type="button" aria-label="Dismiss editing message" onClick={() => setEditNotice('')}>×</button></div>}
-          <div className="timeline-scroll" ref={timelineRef}>
-            <div className="timeline-inner" style={{ width: 190 + project.duration * pxPerSecond + 120 }}>
+          <div className={`timeline-scroll ${isTimelineDropTarget ? 'is-drop-target' : ''}`} ref={timelineRef} onWheel={onTimelineWheel} onDragOver={event => acceptAssetDrag(event)} onDrop={event => dropAsset(event)} onDragLeave={() => { setIsTimelineDropTarget(false); setDropTargetTrackId(null) }}>
+            <div className="timeline-inner" style={{ width: Math.max(timelineRef.current?.clientWidth ?? 0, 190 + project.duration * pxPerSecond + 120) }}>
               <div className="ruler-row timeline-scrub-zone"
                 onPointerDown={beginTimelineScrub}
                 onPointerMove={moveTimelineScrub}
@@ -829,7 +949,7 @@ export function CJCutEditor({
                     <strong>{track.name}</strong>
                     <div className="track-actions">
                       <button onClick={() => toggleTrack(track.id,'visible')}>{track.visible ? <Eye/> : <EyeOff/>}</button>
-                      <button onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button>
+                      <button aria-label={track.locked ? 'Unlock ' + track.name : 'Lock ' + track.name} onClick={() => toggleTrack(track.id,'locked')}>{track.locked ? <Lock/> : <Unlock/>}</button><button aria-label={'Delete track ' + track.name} title="Delete track and its clips" disabled={track.locked} onClick={() => removeTrack(track.id)}><Trash2/></button>
                     </div>
                   </div>
                   <div className="track-lane timeline-scrub-zone"
@@ -837,7 +957,9 @@ export function CJCutEditor({
                     onPointerDown={beginTimelineScrub}
                     onPointerMove={moveTimelineScrub}
                     onPointerUp={endTimelineScrub}
-                    onPointerCancel={endTimelineScrub}>
+                    onPointerCancel={endTimelineScrub}
+                    onDragOver={event => acceptAssetDrag(event, track.id)}
+                    onDrop={event => dropAsset(event, track.id)}>
                     {track.clips.map(clip => (
                       <div key={clip.id}
                         className={`timeline-clip ${TRACK_COLORS[clip.type]} ${selectedClipId===clip.id?'selected':''} ${track.locked?'locked':''}`}
@@ -857,7 +979,7 @@ export function CJCutEditor({
                   </div>
                 </div>
               ))}
-              <div className="add-track-row"><button onClick={addTrack}><Plus size={16}/> Add Track</button></div>
+              <div className={`add-track-row ${isTimelineDropTarget && !dropTargetTrackId ? 'drop-ready' : ''}`} onDragOver={event => acceptAssetDrag(event)} onDrop={event => dropAsset(event)}><button onClick={addTrack}><Plus size={16}/> Add empty track</button><small>Drop media here to create a new track</small></div>
               <div className="playhead" style={{ left: 190 + playhead * pxPerSecond }}>
                 <div className="playhead-head"/><div className="playhead-line"/>
               </div>
