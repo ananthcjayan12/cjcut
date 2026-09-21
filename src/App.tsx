@@ -749,7 +749,7 @@ export function CJCutEditor({
     if (!timeline) return
     const rect = timeline.getBoundingClientRect()
     const start = Math.max(0, (event.clientX - rect.left + timeline.scrollLeft - 190) / pxPerSecond)
-    const compatibleTrack = trackId && project.tracks.find(track => track.id === trackId && track.type === asset.kind && !track.locked)
+    const compatibleTrack = trackId ? project.tracks.find(track => track.id === trackId && track.type === asset.kind && !track.locked) : undefined
     addAsset(asset, snapTime(start), compatibleTrack?.id)
     setEditNotice(compatibleTrack ? 'Media added to existing track.' : 'Media added as a new track at the drop position.')
   }
