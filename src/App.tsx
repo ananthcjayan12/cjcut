@@ -840,6 +840,7 @@ export function CJCutEditor({
             <button className={leftTab === 'audio' ? 'active' : ''} onClick={() => setLeftTab('audio')}><Music2/><span>Audio</span></button>
             <button><Sparkles/><span>Elements</span></button>
           </div>
+          <input ref={fileInputRef} hidden type="file" multiple accept="video/*,audio/*,image/*" onChange={importMedia}/>
           <div className="asset-panel">
             {leftTab === 'media' && <>
               <div className="panel-tabs"><button className="active">Import</button><button>Record</button><button>Stock</button></div>
@@ -847,7 +848,7 @@ export function CJCutEditor({
                 <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
                   <Upload size={25}/><strong>Import Media</strong><span>Videos, images or audio</span>
                 </button>
-                <input ref={fileInputRef} hidden type="file" multiple accept="video/*,audio/*,image/*" onChange={importMedia}/>
+
               </> : <div className="host-media-note"><strong>Project media is managed by the host app.</strong><span>Move, trim, split, hide or remove the supplied clips directly on the timeline.</span></div>}
               <div className="asset-filter"><button className="active">All</button><button>Video</button><button>Image</button><button>Audio</button></div>
               <div className="asset-grid">
@@ -872,7 +873,13 @@ export function CJCutEditor({
             </div>}
             {leftTab === 'audio' && <div className="simple-panel">
               <h3>Audio</h3><p>Import music or narration, then click it to add it to the timeline.</p>
-              {(allowMediaImport || onImportFiles) && <button className="primary-wide" onClick={() => { setLeftTab('media'); fileInputRef.current?.click() }}><Upload size={17}/> Import audio</button>}
+              {(allowMediaImport || onImportFiles) && <button className="primary-wide" onClick={() => fileInputRef.current?.click()}><Upload size={17}/> Import audio</button>}
+              <div className="asset-grid">
+                {assetLibrary.filter(asset => asset.kind === 'audio').map(asset => <button key={asset.id} className="asset-card" draggable onDragStart={event => beginAssetDrag(event, asset)} onDragEnd={() => setDraggingAssetId(null)} onClick={() => addAsset(asset)} title="Drag to the timeline to add an audio track">
+                  <div className="asset-thumb"><Music2 size={19}/></div>
+                  <strong>{asset.name}</strong><small>{formatTime(asset.duration)}</small>
+                </button>)}
+              </div>
             </div>}
           </div>
         </aside>
