@@ -1,4 +1,5 @@
 import type { Clip, Project } from './App'
+import { splitAudioAutomation } from './audio-automation'
 
 export type TimelineSplitResult =
   | { ok: true; project: Project; leftId: string; rightId: string }
@@ -34,7 +35,16 @@ export function splitTimelineClip(
     duration: rightDuration,
     sourceStart: left.sourceStart + leftDuration * left.speed,
   }
-  left.duration = leftDuration
+  if (original.type === 'audio' || original.type === 'video') {
+    const [leftAudio, rightAudio] = splitAudioAutomation(original, leftDuration)
+    left.duration = leftDuration
+    left.fadeIn = leftAudio.fadeIn
+    left.fadeOut = leftAudio.fadeOut
+    left.volumeKeyframes = leftAudio.volumeKeyframes
+    right.fadeIn = rightAudio.fadeIn
+    right.fadeOut = rightAudio.fadeOut
+    right.volumeKeyframes = rightAudio.volumeKeyframes
+  } else left.duration = leftDuration
   changedTrack.clips.push(right)
   return { ok: true, project: cloneProject, leftId: left.id, rightId: right.id }
 }
