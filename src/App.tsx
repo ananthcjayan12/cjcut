@@ -1,11 +1,12 @@
 import {
-  ChevronDown, Copy, Download, Eye, EyeOff, Film, FolderOpen, Image as ImageIcon,
+  ArrowDown, ArrowUp, ChevronDown, Copy, Download, Eye, EyeOff, Film, FolderOpen, Image as ImageIcon,
   Layers3, Lock, Maximize2, Music2, Pause, Play, Plus, Redo2, RotateCcw,
   Scissors, Settings2, SkipBack, SkipForward, Sparkles, Trash2, Type, Undo2,
-  Unlock, Upload, Volume2, ZoomIn, ZoomOut
+  Unlock, Upload, Volume2, VolumeX, ZoomIn, ZoomOut
 } from 'lucide-react'
 import { ChangeEvent, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { splitTimelineClip } from './timeline-operations'
+import { volumeEnvelopeAt, unit, type AudioKeyframe } from './audio-automation'
 
 export type TrackType = 'video' | 'image' | 'audio' | 'text'
 export type MediaKind = Exclude<TrackType, 'text'>
@@ -43,6 +44,9 @@ export type Clip = {
   rotation: number
   opacity: number
   volume: number
+  fadeIn?: number
+  fadeOut?: number
+  volumeKeyframes?: AudioKeyframe[]
   speed: number
   externalId?: string
   role?: 'base' | 'broll' | 'caption' | 'audio' | 'overlay'
@@ -55,6 +59,8 @@ export type Track = {
   type: TrackType
   visible: boolean
   locked: boolean
+  volume?: number
+  muted?: boolean
   clips: Clip[]
   externalId?: string
   role?: 'base' | 'broll' | 'caption' | 'audio' | 'overlay'
@@ -163,6 +169,7 @@ export function CJCutEditor({
   const [project, setProject] = useState<Project>(() => clone(initialProject ?? START_PROJECT))
   const [media, setMedia] = useState<MediaAsset[]>([])
   const [selectedClipId, setSelectedClipId] = useState<string | null>(initialProject ? null : 'welcome-title')
+  const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null)
   const [playhead, setPlayhead] = useState(initialProject ? 0 : 2.2)
   const [editNotice, setEditNotice] = useState('')
   const [playing, setPlaying] = useState(false)
@@ -186,6 +193,9 @@ export function CJCutEditor({
   const pendingZoomAnchor = useRef<{ time: number; viewportX: number } | null>(null)
   const zoomInitializedRef = useRef(false)
   const previewRefs = useRef<Record<string, HTMLVideoElement | HTMLAudioElement | null>>({})
+  const mediaRefHandlers = useRef<Record<string, (node: HTMLVideoElement | HTMLAudioElement | null) => void>>({})
+  const activePlaybackIds = useRef(new Set<string>())
+  const playheadNow = useRef(playhead)
   const loadedProjectKeyRef = useRef(projectKey)
   const externalProjectRef = useRef(initialProject)
   const onProjectChangeRef = useRef(onProjectChange)
@@ -204,6 +214,8 @@ export function CJCutEditor({
     loadedProjectKeyRef.current = projectKey
     setProject(clone(initialProject))
     setSelectedClipId(null)
+    setSelectedTrackId(null)
+    activePlaybackIds.current.clear()
     setPlayhead(time => Math.min(time, initialProject.duration))
     setEditNotice('')
     setPlaying(false)
@@ -279,6 +291,20 @@ export function CJCutEditor({
     }
     return null
   }, [project, selectedClipId])
+
+  const selectedTrack = project.tracks.find(t => t.id === (selected?.trackId ?? selectedTrackId)) ?? null
+  const trackForClip = (clip: Clip) => project.tracks.find(t => t.id === clip.trackId)
+  const effectiveVolume = (clip: Clip, localSeconds: number) => {
+    const track = trackForClip(clip)
+    return track?.muted ? 0 : unit(unit(track?.volume ?? 1) * unit(clip.volume) * volumeEnvelopeAt(clip, localSeconds, clip.duration))
+  }
+  const bindMediaRef = (id: string) => {
+    if (!mediaRefHandlers.current[id]) mediaRefHandlers.current[id] = node => {
+      if (node) previewRefs.current[id] = node
+      else delete previewRefs.current[id]
+    }
+    return mediaRefHandlers.current[id]
+  }
 
   const visibleClips = useMemo(() =>
     project.tracks
@@ -708,6 +734,33 @@ export function CJCutEditor({
     })
   }
 
+  const moveTrack = (id: string, direction: -1 | 1) => {
+    const index = project.tracks.findIndex(t => t.id === id)
+    const to = index + direction
+    if (index < 0 || to < 0 || to >= project.tracks.length) return
+    commit(p => {
+      const [track] = p.tracks.splice(index, 1)
+      p.tracks.splice(to, 0, track)
+      return p
+    })
+    setSelectedTrackId(id)
+    setEditNotice('Layer order updated. Higher tracks render above lower tracks.')
+  }
+
+  const updateTrackAudio = (id: string, patch: Partial<Pick<Track, 'volume' | 'muted'>>) => {
+    commit(p => {
+      const track = p.tracks.find(t => t.id === id)
+      if (track && !track.locked) Object.assign(track, patch)
+      return p
+    })
+  }
+
+  const addVolumePoint = (clip: Clip, time: number, gain: number) => {
+    const next = [...(clip.volumeKeyframes ?? []).filter(point => Math.abs(point.time - time) > 0.025), { time, gain: unit(gain) }]
+      .sort((a, b) => a.time - b.time)
+    updateSelected({ volumeKeyframes: next })
+  }
+
   const toggleTrack = (id: string, key: 'visible' | 'locked') => {
     commit(p => {
       const track = p.tracks.find(t => t.id === id)
@@ -736,6 +789,7 @@ export function CJCutEditor({
       return p
     })
     if (track.clips.some(clip => clip.id === selectedClipId)) setSelectedClipId(null)
+    if (selectedTrackId === id) setSelectedTrackId(null)
     setEditNotice('Track removed. Undo to restore it.')
   }
 
