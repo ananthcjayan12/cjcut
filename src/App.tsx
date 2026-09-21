@@ -1107,7 +1107,7 @@ export function CJCutEditor({
                           {clip.type === 'audio' ? <Wave/> : clip.type === 'text' ? <Type size={14}/> : clip.type === 'image' ? <ImageIcon size={14}/> : <Film size={14}/>}
                           <span>{clip.text || clip.name}</span>
                         </div>
-                        {(clip.type === 'audio' || clip.type === 'video') && !!clip.volumeKeyframes?.length && <div className="clip-gain-points" aria-label="Volume automation points">{clip.volumeKeyframes.map((point,idx)=><span key={idx} title={point.time.toFixed(2)+'s · '+Math.round(point.gain*100)+'%'} style={{left:(Math.max(0,Math.min(clip.duration,point.time))/clip.duration)*100+'%',bottom:(6+point.gain*15)+'px'}}/>)}</div>
+                        {(clip.type === 'audio' || clip.type === 'video') && !!clip.volumeKeyframes?.length && <div className="clip-gain-points" aria-label="Volume automation points">{clip.volumeKeyframes.map((point,idx)=><span key={idx} title={point.time.toFixed(2)+'s · '+Math.round(point.gain*100)+'%'} style={{left:(Math.max(0,Math.min(clip.duration,point.time))/clip.duration)*100+'%',bottom:(6+point.gain*15)+'px'}}/>)}</div>}
                         <div className="trim-handle right" onPointerDown={e => beginClipDrag(e,clip,'trim-right')}/>
                       </div>
                     ))}
