@@ -88,6 +88,25 @@ export type CJCutEditorProps = {
   onSave?: (project: Project) => void
 }
 
+type CanvasGesture = {
+  mode: 'move' | 'scale' | 'rotate'
+  clipId: string
+  startX: number
+  startY: number
+  initialX: number
+  initialY: number
+  initialScale: number
+  initialRotation: number
+  initialDistance: number
+  initialAngle: number
+  centerX: number
+  centerY: number
+  rectWidth: number
+  rectHeight: number
+  moved: boolean
+  snapshot: Project
+}
+
 type DragState = {
   mode: 'move' | 'trim-left' | 'trim-right'
   clipId: string
@@ -184,6 +203,9 @@ export function CJCutEditor({
   const [clipboard, setClipboard] = useState<Clip | null>(null)
   const [showExport, setShowExport] = useState(false)
   const dragRef = useRef<DragState | null>(null)
+  const canvasRef = useRef<HTMLDivElement | null>(null)
+  const gestureRef = useRef<CanvasGesture | null>(null)
+  const [snapGuides, setSnapGuides] = useState<{ vertical: boolean; horizontal: boolean }>({ vertical: false, horizontal: false })
   const scrubbingRef = useRef(false)
   const rafRef = useRef<number | null>(null)
   const lastFrameRef = useRef<number | null>(null)
@@ -496,6 +518,76 @@ export function CJCutEditor({
     })
   }
 
+  // Direct manipulation on the preview canvas: drag to move, corner handle to scale, top handle to rotate.
+  // Coordinates are stored as percentages of the canvas, exactly what the inspector and the exporter use.
+  const SNAP_PERCENT = 1.2
+  const patchClip = (clipId: string, patch: Partial<Clip>) => setProject(current => {
+    const next = clone(current)
+    for (const track of next.tracks) { const clip = track.clips.find(c => c.id === clipId); if (clip) Object.assign(clip, patch) }
+    return next
+  })
+
+  const beginCanvasGesture = (event: ReactPointerEvent, clip: Clip, mode: CanvasGesture['mode']) => {
+    if (event.button !== 0) return
+    event.stopPropagation()
+    // Alt-click walks down through the stack, so a full-frame overlay never traps the layers underneath it.
+    if (event.altKey && mode === 'move') {
+      const stack = visibleClips.filter(v => v.clip.type !== 'audio').sort((a, b) => a.trackIndex - b.trackIndex).map(v => v.clip)
+      const at = stack.findIndex(c => c.id === selectedClipId)
+      setSelectedClipId((stack[(at + 1) % stack.length] ?? clip).id)
+      return
+    }
+    setSelectedClipId(clip.id)
+    const canvas = canvasRef.current
+    if (!canvas || findTrack(clip.trackId)?.locked) return
+    event.preventDefault()
+    const rect = canvas.getBoundingClientRect()
+    const centerX = rect.left + clip.x / 100 * rect.width
+    const centerY = rect.top + clip.y / 100 * rect.height
+    gestureRef.current = {
+      mode, clipId: clip.id, startX: event.clientX, startY: event.clientY,
+      initialX: clip.x, initialY: clip.y, initialScale: clip.scale, initialRotation: clip.rotation,
+      initialDistance: Math.max(8, Math.hypot(event.clientX - centerX, event.clientY - centerY)),
+      initialAngle: Math.atan2(event.clientY - centerY, event.clientX - centerX),
+      centerX, centerY, rectWidth: rect.width, rectHeight: rect.height, moved: false, snapshot: clone(project),
+    }
+    ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  }
+
+  const moveCanvasGesture = (event: ReactPointerEvent) => {
+    const gesture = gestureRef.current
+    if (!gesture) return
+    if (!gesture.moved && Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY) < 3) return
+    gesture.moved = true
+    if (gesture.mode === 'move') {
+      let x = gesture.initialX + (event.clientX - gesture.startX) / gesture.rectWidth * 100
+      let y = gesture.initialY + (event.clientY - gesture.startY) / gesture.rectHeight * 100
+      const snap = !event.altKey && !event.metaKey
+      const vertical = snap && Math.abs(x - 50) < SNAP_PERCENT
+      const horizontal = snap && Math.abs(y - 50) < SNAP_PERCENT
+      if (vertical) x = 50
+      if (horizontal) y = 50
+      setSnapGuides(g => g.vertical === vertical && g.horizontal === horizontal ? g : { vertical, horizontal })
+      patchClip(gesture.clipId, { x: Math.round(Math.max(-100, Math.min(200, x)) * 100) / 100, y: Math.round(Math.max(-100, Math.min(200, y)) * 100) / 100 })
+    } else if (gesture.mode === 'scale') {
+      const distance = Math.hypot(event.clientX - gesture.centerX, event.clientY - gesture.centerY)
+      patchClip(gesture.clipId, { scale: Math.round(Math.max(0.1, Math.min(2.5, gesture.initialScale * distance / gesture.initialDistance)) * 100) / 100 })
+    } else {
+      const angle = Math.atan2(event.clientY - gesture.centerY, event.clientX - gesture.centerX)
+      let rotation = gesture.initialRotation + (angle - gesture.initialAngle) * 180 / Math.PI
+      rotation = ((rotation + 540) % 360) - 180
+      if (event.shiftKey) rotation = Math.round(rotation / 15) * 15
+      patchClip(gesture.clipId, { rotation: Math.round(rotation * 10) / 10 })
+    }
+  }
+
+  const endCanvasGesture = () => {
+    const gesture = gestureRef.current
+    gestureRef.current = null
+    setSnapGuides({ vertical: false, horizontal: false })
+    if (gesture?.moved) pushSnapshot(gesture.snapshot)
+  }
+
   const endClipDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
     if (!drag) return
@@ -657,6 +749,15 @@ export function CJCutEditor({
       if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteClip(); return }
       if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSelected(); return }
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedClipId) { e.preventDefault(); deleteSelected(); return }
+      if (e.altKey && selected && e.key.startsWith('Arrow') && !findTrack(selected.trackId)?.locked) {
+        e.preventDefault()
+        const step = e.shiftKey ? 5 : 0.5
+        updateSelected({
+          x: selected.x + (e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0),
+          y: selected.y + (e.key === 'ArrowDown' ? step : e.key === 'ArrowUp' ? -step : 0),
+        })
+        return
+      }
       if (e.key === 'ArrowLeft') { e.preventDefault(); setPlayhead(t => Math.max(0, t - (e.shiftKey ? 1 : 1 / project.fps))); return }
       if (e.key === 'ArrowRight') { e.preventDefault(); setPlayhead(t => Math.min(project.duration, t + (e.shiftKey ? 1 : 1 / project.fps))); return }
       if (mod && (e.key === '=' || e.key === '+')) { e.preventDefault(); setZoom(z => Math.min(3, z + 0.2)); return }
@@ -971,7 +1072,7 @@ export function CJCutEditor({
 
         <section className="preview-section">
           <div className="preview-stage">
-            <div className="canvas" style={{ aspectRatio: `${project.width}/${project.height}` }}>
+            <div className="canvas" ref={canvasRef} style={{ aspectRatio: `${project.width}/${project.height}` }}>
               {visibleClips.filter(v => v.clip.type !== 'audio').length === 0 && (
                 <div className="canvas-empty"><Film size={44}/><strong>Import media to start editing</strong><span>Your preview appears here</span></div>
               )}
@@ -981,12 +1082,22 @@ export function CJCutEditor({
                 .map(({ clip }) => (
                   <div key={clip.id} className={`preview-layer ${clip.type === 'video' || clip.type === 'image' ? 'media-layer' : ''} ${selectedClipId === clip.id ? 'selected' : ''}`}
                     style={{ left: clip.x + '%', top: clip.y + '%', opacity: clip.opacity, transform: `translate(-50%,-50%) scale(${clip.scale}) rotate(${clip.rotation}deg)` }}
-                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id) }}>
+                    onPointerDown={e => beginCanvasGesture(e, clip, 'move')}
+                    onPointerMove={moveCanvasGesture}
+                    onPointerUp={endCanvasGesture}
+                    onPointerCancel={endCanvasGesture}
+                    onClick={(e) => e.stopPropagation()}>
                     {clip.type === 'video' && clip.url && <video ref={bindMediaRef(clip.id)} src={clip.url} playsInline preload="auto" onCanPlay={() => startMedia(clip)} />}
                     {clip.type === 'image' && clip.url && <img src={clip.url}/>}
                     {clip.type === 'text' && <div className="preview-text">{clip.text}</div>}
+                    {selectedClipId === clip.id && !findTrack(clip.trackId)?.locked && <>
+                      <span className="transform-handle rotate" title="Drag to rotate (Shift snaps to 15°)" style={{ transform: `translateX(-50%) scale(${1 / clip.scale})` }} onPointerDown={e => beginCanvasGesture(e, clip, 'rotate')} onPointerMove={moveCanvasGesture} onPointerUp={endCanvasGesture} onPointerCancel={endCanvasGesture}/>
+                      <span className="transform-handle scale" title="Drag to scale" style={{ transform: `scale(${1 / clip.scale})` }} onPointerDown={e => beginCanvasGesture(e, clip, 'scale')} onPointerMove={moveCanvasGesture} onPointerUp={endCanvasGesture} onPointerCancel={endCanvasGesture}/>
+                    </>}
                   </div>
                 ))}
+              {snapGuides.vertical && <div className="snap-guide vertical"/>}
+              {snapGuides.horizontal && <div className="snap-guide horizontal"/>}
               {visibleClips.filter(({clip}) => clip.type === 'audio' && clip.url).map(({clip}) =>
                 <audio key={clip.id} ref={bindMediaRef(clip.id)} src={clip.url} preload="auto" onCanPlay={() => startMedia(clip)}/>
               )}
@@ -1009,7 +1120,8 @@ export function CJCutEditor({
             <section className="property-section">
               <h4><ChevronDown size={15}/> Transform</h4>
               <div className="coord-row"><label>Position</label><div><span>X</span><input type="number" value={Math.round(selected.x)} onChange={e => updateSelected({x:+e.target.value})}/><span>Y</span><input type="number" value={Math.round(selected.y)} onChange={e => updateSelected({y:+e.target.value})}/></div></div>
-              <Range label="Scale" min={0.25} max={2.5} step={0.05} value={selected.scale} suffix={Math.round(selected.scale*100)+'%'} onChange={value => updateSelected({scale:value})}/>
+              <div className="transform-reset-row"><button onClick={() => updateSelected({ x: 50, y: 50, scale: 1, rotation: 0 })}>Reset transform</button><small>Drag on the preview to move · corner handle scales · top handle rotates · Alt-click selects the layer beneath · Alt+arrows nudge</small></div>
+              <Range label="Scale" min={0.1} max={2.5} step={0.05} value={selected.scale} suffix={Math.round(selected.scale*100)+'%'} onChange={value => updateSelected({scale:value})}/>
               <Range label="Rotation" min={-180} max={180} step={1} value={selected.rotation} suffix={Math.round(selected.rotation)+'°'} onChange={value => updateSelected({rotation:value})}/>
               <Range label="Opacity" min={0} max={1} step={0.01} value={selected.opacity} suffix={Math.round(selected.opacity*100)+'%'} onChange={value => updateSelected({opacity:value})}/>
             </section>

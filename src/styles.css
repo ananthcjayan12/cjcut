@@ -223,3 +223,14 @@
 .cjcut-editor .audio-keyframe-row > button { font-size:16px; color:#fca5a5; }
 .cjcut-editor .clip-gain-points { position:absolute; bottom:0; left:0; right:0; pointer-events:none; height:25px; }
 .cjcut-editor .clip-gain-points span { width:6px; height:6px; border:1px solid #f8fafc; border-radius:50%; background:#38bdf8; position:absolute; transform:translateX(-50%); }
+
+.cjcut-editor .preview-layer { touch-action:none; cursor:grab; }
+.cjcut-editor .preview-layer:active { cursor:grabbing; }
+.cjcut-editor .transform-handle { position:absolute; width:16px; height:16px; border-radius:50%; background:#fff; border:2px solid #4c91ff; box-shadow:0 1px 6px #0009; z-index:5; touch-action:none; }
+.cjcut-editor .transform-handle.scale { right:10px; bottom:10px; cursor:nwse-resize; transform-origin:bottom right; }
+.cjcut-editor .transform-handle.rotate { left:50%; top:10px; cursor:crosshair; transform-origin:top center; }
+.cjcut-editor .snap-guide { position:absolute; background:#ff4d8d; pointer-events:none; z-index:6; opacity:.9; }
+.cjcut-editor .snap-guide.vertical { left:50%; top:0; bottom:0; width:1px; }
+.cjcut-editor .snap-guide.horizontal { top:50%; left:0; right:0; height:1px; }
+.cjcut-editor .transform-reset-row { display:grid; gap:6px; margin:4px 0 8px; }
+.cjcut-editor .transform-reset-row small { color:#68717d; font-size:10.5px; line-height:1.4; }
